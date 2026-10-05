@@ -1,0 +1,1043 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>ホネツギ</title>
+<meta name="description" content="骨をつないで、自動で殴りあう。勝つと相手の骨をもらえる。3戦ごとにボスが出る。あなたは何連勝できる？">
+<meta name="theme-color" content="#17132b">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&display=swap" rel="stylesheet">
+<style>
+:root { --page-bg: #17132b; --page-fg: #fbf7ec; }
+html, body { margin: 0; height: 100%; background: var(--page-bg); color: var(--page-fg); overflow: hidden; overscroll-behavior: none; }
+body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; }
+#app { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+canvas { display: block; touch-action: none; outline: none; }
+</style>
+</head>
+<body>
+<div id="app"><canvas id="c" aria-label="ホネツギ（ゲーム画面）" role="img"></canvas></div>
+<script>
+'use strict';
+/* ============================================================
+   バトルの中身（物理・当たり判定・ダメージ）。画面がなくても動く。
+   座標は 横360 の画面と同じ。y は下向きがプラス。
+   ============================================================ */
+const SIM = (() => {
+  /* ---------- 設定（ここを書き換えると調整できます） ---------- */
+  const GY = 430;                 // 地面の高さ
+  const XL = 14, XR = 346;        // 左右の壁
+  const HOV = 96;                 // ドクロが浮く高さ（地面から）。背骨の先（腰）にあし骨をつなぐと、少し開いても地面に届く高さ
+  const GRAV = 900;               // 重力
+  const SUB = 2, ITER = 4;        // 1コマを何回に分けて計算するか／骨の長さを保つ計算の回数
+  const DT = 1 / 60 / SUB;
+  const SKULL_R = 15, SKULL_M = 4;
+  const HOVER_K = 60, HOVER_C = 12;   // 浮く力のばね・ブレーキ
+  const DRIVE = 110, DRIVE_FOOT = 170, DRIVE_C = 3;   // 相手へ向かう力（足が地面につくと速くなる）
+  const TIME_LIMIT = 30;          // 1試合の長さ（秒）。時間切れは体力の割合で決める
+  const IFRAME = 0.3;             // ドクロが続けてダメージを受けない時間（秒）
+  const RAGE_FROM = 7, RAGE_STEP = 4, RAGE_MAX = 5;   // 長引くと ダメージが増えていく（7秒から、4秒ごとに＋1倍、最大＋5倍）
+  const MAX_BONES = 12;           // つなげる骨の本数の上限（下の背骨は数えない）
+  const BASE = ['S', -1, 90];     // 全員が最初から持っている背骨。ドクロの真下に固定で、外せない・折れない
+
+  /* 骨の種類
+     L=長さ r=太さ m=重さ amp=振る大きさ(ラジアン) w=振る速さ k=関節の強さ
+     atk=ドクロに当てた時のダメージ dur=折れにくさ brk=相手の骨を折る力 */
+  const TYPES = {
+    A: { name: 'うで骨', desc: 'ブンブン振って殴る。まずはこれ', L: 46, r: 4, m: 1.0, amp: 1.1, w: 7.0, k: 0.22, atk: 9, dur: 40, brk: 8 },
+    L: { name: 'あし骨', desc: '地面につくと速く進み、押し負けにくい', L: 56, r: 5, m: 1.4, amp: 0.45, w: 6.0, k: 0.30, atk: 5, dur: 60, brk: 8, foot: true },
+    S: { name: 'せぼね', desc: 'ほとんど動かない。体をのばす土台', L: 38, r: 5, m: 1.2, amp: 0.08, w: 3.0, k: 0.40, atk: 3, dur: 70, brk: 6 },
+    R: { name: 'あばら', desc: '太くて折れにくい盾。ドクロを守る', L: 32, r: 8, m: 1.6, amp: 0.05, w: 3.0, k: 0.45, atk: 2, dur: 90, brk: 10 },
+    H: { name: 'ツノ', desc: '短いが、当たると大ダメージ', L: 26, r: 3.5, m: 0.6, amp: 0.0, w: 1.0, k: 0.50, atk: 16, dur: 45, brk: 14, pierce: true },
+    T: { name: 'しっぽ骨', desc: '長くて軽いムチ。遠くまで届くが折れやすい', L: 64, r: 3, m: 0.7, amp: 1.4, w: 9.0, k: 0.10, atk: 7, dur: 25, brk: 5 },
+    C: { name: 'こんぼう骨', desc: '重くて遅いが、一発が大きい', L: 58, r: 7, m: 2.6, amp: 0.9, w: 4.2, k: 0.16, atk: 15, dur: 90, brk: 18 },
+  };
+
+  /* ---------- 小さな道具 ---------- */
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const wrap = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+  function rng(seed) {
+    let a = seed >>> 0;
+    return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+
+  /* ---------- 骨の体を作る ----------
+     spec.bones = [[種類, 親(−1ならドクロ), 角度(度)], ...]   ※先頭（0番）は全員共通の背骨 BASE
+     角度は「右向き」で作った時のもの。ドクロにつなぐ骨は 0=前 90=下 −90=上。
+     骨につなぐ骨は、親の骨の向きから何度曲げるか。左向き（敵）は自動で左右反転する。
+     spec.scale = 体の大きさ（ボス用。1.3 なら 1.3倍。長さ・太さ・浮く高さが大きくなり、重さは2乗、折れにくさも上がる） */
+  function makeCreature(spec, dir, x0, hp, rnd) {
+    const sc = spec.scale > 0 ? +spec.scale : 1;
+    const c = { dir, hp, hpMax: hp, pw: 1, pts: [], bones: [], inv: 0, feet: 0, name: spec.name || '', mass: 0, flash: 0, sc, boss: !!spec.boss, skullR: SKULL_R * sc, hov: HOV * sc, sm: SKULL_M * sc * sc };
+    c.pts.push({ x: x0, y: GY - c.hov, px: x0, py: GY - c.hov, m: c.sm, r: c.skullR });
+    const list = (spec.bones || []).slice(0, MAX_BONES + 1);
+    list.forEach(([ty, par, deg], i) => {
+      const t = TYPES[ty]; if (!t) return;
+      const base = i === 0 && ty === BASE[0] && par < 0 && deg === BASE[2];   // 体の芯の背骨
+      if (par >= i) par = -1;
+      const a = par < 0 ? 0 : c.bones[par].b;
+      const relB = deg * Math.PI / 180, absB = (par < 0 ? 0 : c.bones[par].absB) + relB;
+      const abs = dir > 0 ? absB : Math.PI - absB;
+      const pa = c.pts[a], b = c.pts.length, L = t.L * sc, r = t.r * sc;
+      const x = pa.x + Math.cos(abs) * L, y = pa.y + Math.sin(abs) * L;
+      c.pts.push({ x, y, px: x, py: y, m: 0, r, foot: !!t.foot });
+      c.bones.push({ ty, t, a, b, par, L, r, m: t.m * sc * sc, rel: par < 0 ? abs : (dir > 0 ? relB : -relB), absB, phase: i * 2.1 + rnd() * 0.8, dur: t.dur * sc, durMax: t.dur * sc, cd: 0, alive: true, sub: [b], k: t.k, base });
+    });
+    for (let i = c.bones.length - 1; i >= 0; i--) { const p = c.bones[i].par; if (p >= 0) c.bones[p].sub.push(...c.bones[i].sub); }
+    c.bones.forEach(bn => { c.pts[bn.a].m += bn.m / 2; c.pts[bn.b].m += bn.m / 2; c.mass += bn.m; });
+    c.bones.forEach(bn => { let load = 0; bn.sub.forEach(pi => { load += c.pts[pi].m; }); bn.k = bn.t.k / (1 + 0.22 * Math.max(0, load - bn.m) / (sc * sc)); });   // 先に重い物がぶら下がるほど、関節は弱くなる
+    return c;
+  }
+
+  function makeWorld(specA, specB, opt) {
+    opt = opt || {};
+    const rnd = rng(opt.seed || 1);
+    const w = { t: 0, clock: 0, active: false, over: null, ev: [], debris: [], rnd, limit: opt.limit || TIME_LIMIT };
+    w.A = makeCreature(specA, 1, 92, opt.hpA || 100, rnd);
+    w.B = makeCreature(specB, -1, 268, opt.hpB || 100, rnd); w.B.pw = opt.pwB || 1;   // pw＝相手の攻撃の強さ（1より小さいと手加減）
+    for (let i = 0; i < 40; i++) stepWorld(w);     // 始まる前に姿勢を落ち着かせる
+    w.ev.length = 0; w.t = 0;
+    return w;
+  }
+
+  /* ---------- 1体ぶんの動き ---------- */
+  function integrate(w, c, e) {
+    const P = c.pts, s = P[0];
+    // ドクロ：浮く＋相手へ向かう
+    let vx = (s.x - s.px) / DT, vy = (s.y - s.py) / DT;
+    const f = 1 + 0.5 * c.mass / c.sm;
+    let ax = -DRIVE_C * vx, ay = (-HOVER_K * (s.y - (GY - c.hov)) - HOVER_C * vy) * f;
+    if (w.active && !w.over) {
+      const gap = Math.abs(e.pts[0].x - s.x), toward = Math.sign(e.pts[0].x - s.x) || c.dir;
+      ax += toward * (DRIVE + DRIVE_FOOT * Math.min(2, c.feet)) * clamp((gap - (c.skullR + e.skullR + 2)) / 26, 0, 1);
+    }
+    if (c.hp <= 0) { ax = 0; ay = GRAV; }           // 負けたドクロは落ちる
+    s.px = s.x; s.py = s.y; s.x += vx * DT + ax * DT * DT; s.y += vy * DT + ay * DT * DT;
+    for (let i = 1; i < P.length; i++) {
+      const p = P[i]; if (p.dead) continue;
+      const dx = (p.x - p.px) * 0.995, dy = (p.y - p.py) * 0.995;
+      p.px = p.x; p.py = p.y; p.x += dx; p.y += dy + GRAV * DT * DT;
+    }
+  }
+  function muscles(w, c) {
+    if (c.hp <= 0) return;
+    const P = c.pts;
+    for (const bn of c.bones) {
+      if (!bn.alive) continue;
+      const pa = P[bn.a], pb = P[bn.b];
+      const cur = Math.atan2(pb.y - pa.y, pb.x - pa.x);
+      let ref = 0;
+      if (bn.par >= 0) { const q = c.bones[bn.par], qa = P[q.a], qb = P[q.b]; ref = Math.atan2(qb.y - qa.y, qb.x - qa.x); }
+      const osc = c.dir * bn.t.amp * Math.sin(bn.t.w * w.clock + bn.phase) * (w.active ? 1 : 0.25);
+      const st = clamp(wrap(ref + bn.rel + osc - cur) * bn.k, -0.2, 0.2);
+      if (Math.abs(st) < 1e-5) continue;
+      const cs = Math.cos(st), sn = Math.sin(st);
+      for (const pi of bn.sub) { const p = P[pi]; if (p.dead) continue; const dx = p.x - pa.x, dy = p.y - pa.y; p.x = pa.x + dx * cs - dy * sn; p.y = pa.y + dx * sn + dy * cs; }
+    }
+  }
+  function constraints(c) {
+    const P = c.pts;
+    for (let it = 0; it < ITER; it++) {
+      for (const bn of c.bones) {
+        if (!bn.alive) continue;
+        const pa = P[bn.a], pb = P[bn.b];
+        let dx = pb.x - pa.x, dy = pb.y - pa.y; const d = Math.hypot(dx, dy) || 1e-6, diff = (d - bn.L) / d;
+        const wa = 1 / pa.m, wb = 1 / pb.m, sum = wa + wb;
+        pa.x += dx * diff * wa / sum; pa.y += dy * diff * wa / sum; pb.x -= dx * diff * wb / sum; pb.y -= dy * diff * wb / sum;
+      }
+      bounds(c);
+    }
+  }
+  function bounds(c) {
+    const P = c.pts; let feet = 0;
+    for (let i = 0; i < P.length; i++) {
+      const p = P[i]; if (p.dead) continue;
+      if (p.y > GY - p.r) { p.y = GY - p.r; const mu = p.foot ? 0.45 : 0.12; p.px = p.x - (p.x - p.px) * (1 - mu); if (p.foot) feet++; }
+      if (p.x < XL + p.r) p.x = XL + p.r; else if (p.x > XR - p.r) p.x = XR - p.r;
+    }
+    c.feet = feet;
+  }
+
+  /* ---------- 当たり判定（骨＝太さのある線、ドクロ＝丸） ---------- */
+  function closest(ax, ay, bx, by, cx, cy, dx, dy) {   // 線分 AB と線分 CD の、いちばん近い点
+    const ux = bx - ax, uy = by - ay, vx = dx - cx, vy = dy - cy, wx = ax - cx, wy = ay - cy;
+    const a = ux * ux + uy * uy, b = ux * vx + uy * vy, c = vx * vx + vy * vy, d = ux * wx + uy * wy, e = vx * wx + vy * wy, D = a * c - b * b;
+    let sN, sD = D, tN, tD = D;
+    if (D < 1e-9) { sN = 0; sD = 1; tN = e; tD = c; } else { sN = b * e - c * d; tN = a * e - b * d; if (sN < 0) { sN = 0; tN = e; tD = c; } else if (sN > sD) { sN = sD; tN = e + b; tD = c; } }
+    if (tN < 0) { tN = 0; if (-d < 0) sN = 0; else if (-d > a) sN = sD; else { sN = -d; sD = a; } }
+    else if (tN > tD) { tN = tD; if (-d + b < 0) sN = 0; else if (-d + b > a) sN = sD; else { sN = -d + b; sD = a; } }
+    const s = Math.abs(sN) < 1e-9 || sD < 1e-9 ? 0 : sN / sD, t = Math.abs(tN) < 1e-9 || tD < 1e-9 ? 0 : tN / tD;
+    return [s, t];
+  }
+  function sticks(c) {       // 当たり判定に使う「線」の一覧。ドクロは長さ0の線
+    const out = [{ a: c.pts[0], b: c.pts[0], r: c.skullR, skull: true, bn: null }];
+    for (const bn of c.bones) if (bn.alive) out.push({ a: c.pts[bn.a], b: c.pts[bn.b], r: bn.r, skull: false, bn });
+    return out;
+  }
+  function breakBone(w, c, bn) {   // 骨が折れる：その先につながる骨ごと外れて落ちる
+    const P = c.pts, idx = c.bones.indexOf(bn);
+    const gone = c.bones.filter((q, i) => q.alive && (i === idx || bn.sub.indexOf(q.b) >= 0));
+    for (const q of gone) {
+      q.alive = false;
+      const pa = P[q.a], pb = P[q.b], kick = 120 + w.rnd() * 160, ang = -Math.PI / 2 + (w.rnd() - 0.5) * 2.2;
+      w.debris.push({ ty: q.ty, side: c.dir, sc: c.sc, x1: pa.x, y1: pa.y, x2: pb.x, y2: pb.y, vx: Math.cos(ang) * kick + (pb.x - pb.px) / DT * 0.4, vy: Math.sin(ang) * kick, w: (w.rnd() - 0.5) * 14, t: 0 });
+      P[q.b].dead = true;
+    }
+    c.mass = 0; for (const q of c.bones) if (q.alive) c.mass += q.m;
+    w.ev.push({ k: 'break', x: P[bn.a].x, y: P[bn.a].y, side: c.dir, n: gone.length });
+  }
+  function collide(w, A, B) {
+    const SA = sticks(A), SB = sticks(B);
+    for (const p of SA) for (const q of SB) {
+      const [s, t] = p.skull ? [0, closestPt(p.a, q)] : q.skull ? [closestPt(q.a, p), 0] : closest(p.a.x, p.a.y, p.b.x, p.b.y, q.a.x, q.a.y, q.b.x, q.b.y);
+      const px = p.a.x + (p.b.x - p.a.x) * s, py = p.a.y + (p.b.y - p.a.y) * s, qx = q.a.x + (q.b.x - q.a.x) * t, qy = q.a.y + (q.b.y - q.a.y) * t;
+      let nx = px - qx, ny = py - qy; const d = Math.hypot(nx, ny), R = p.r + q.r;
+      if (d >= R) continue;
+      if (d < 1e-6) { nx = A.dir > 0 ? -1 : 1; ny = 0; } else { nx /= d; ny /= d; }
+      // 近づく速さ
+      const vpx = ((p.a.x - p.a.px) * (1 - s) + (p.b.x - p.b.px) * s) / DT, vpy = ((p.a.y - p.a.py) * (1 - s) + (p.b.y - p.b.py) * s) / DT;
+      const vqx = ((q.a.x - q.a.px) * (1 - t) + (q.b.x - q.b.px) * t) / DT, vqy = ((q.a.y - q.a.py) * (1 - t) + (q.b.y - q.b.py) * t) / DT;
+      const vn = -((vpx - vqx) * nx + (vpy - vqy) * ny);
+      // 押し戻す（重い方が動きにくい）
+      const wp = p.skull ? 1 / p.a.m : (1 - s) * (1 - s) / p.a.m + s * s / p.b.m, wq = q.skull ? 1 / q.a.m : (1 - t) * (1 - t) / q.a.m + t * t / q.b.m;
+      const lam = Math.min(R - d, 4) / (wp + wq);
+      if (p.skull) { p.a.x += nx * lam / p.a.m; p.a.y += ny * lam / p.a.m; } else { p.a.x += nx * lam * (1 - s) / p.a.m; p.a.y += ny * lam * (1 - s) / p.a.m; p.b.x += nx * lam * s / p.b.m; p.b.y += ny * lam * s / p.b.m; }
+      if (q.skull) { q.a.x -= nx * lam / q.a.m; q.a.y -= ny * lam / q.a.m; } else { q.a.x -= nx * lam * (1 - t) / q.a.m; q.a.y -= ny * lam * (1 - t) / q.a.m; q.b.x -= nx * lam * t / q.b.m; q.b.y -= ny * lam * t / q.b.m; }
+      if (!w.active || w.over) continue;
+      const cx = (px + qx) / 2, cy = (py + qy) / 2;
+      if (p.skull && q.skull) {                       // 頭突き：おたがい少しだけ痛い
+        if (vn > 60 && A.inv <= 0 && B.inv <= 0) { hurt(w, A, 4, cx, cy, nx, ny); hurt(w, B, 4, cx, cy, -nx, -ny); }
+      } else if (p.skull) strike(w, A, B, q.bn, vn, t, cx, cy, nx, ny);
+      else if (q.skull) strike(w, B, A, p.bn, vn, s, cx, cy, -nx, -ny);
+      else if (vn > 120 && p.bn.cd <= 0 && q.bn.cd <= 0) {   // 骨どうし：おたがい少しずつ傷む
+        const k = clamp(vn / 300, 0.3, 1.5) * rage(w);
+        if (!p.bn.base && !q.bn.base) { p.bn.dur -= q.bn.t.brk * k * B.pw; q.bn.dur -= p.bn.t.brk * k * A.pw; }   // 体の芯の背骨は折れないし、当たった骨も傷めない
+        p.bn.cd = q.bn.cd = 0.15;
+        w.ev.push({ k: 'clack', x: cx, y: cy, v: vn });
+        if (p.bn.dur <= 0) breakBone(w, A, p.bn);
+        if (q.bn.dur <= 0) breakBone(w, B, q.bn);
+      }
+    }
+  }
+  function closestPt(pt, st) {    // 点から線分へ、いちばん近い所（0〜1）
+    const ux = st.b.x - st.a.x, uy = st.b.y - st.a.y, L2 = ux * ux + uy * uy;
+    return L2 < 1e-9 ? 0 : clamp(((pt.x - st.a.x) * ux + (pt.y - st.a.y) * uy) / L2, 0, 1);
+  }
+  function strike(w, def, att, bn, vn, along, x, y, nx, ny) {   // 相手の骨がドクロに当たった
+    if (def.inv > 0 || vn < 40) return;
+    const t = bn.t;
+    let dmg = t.atk * (t.pierce ? clamp(vn / 220, 0.9, 1.5) : clamp(vn / 220, 0.5, 1.8));
+    if (along > 0.7) dmg *= 1.2;                     // 骨の先で当てると強い
+    hurt(w, def, dmg * att.pw, x, y, nx, ny);
+  }
+  const rage = w => 1 + clamp((w.t - RAGE_FROM) / RAGE_STEP, 0, RAGE_MAX);
+  function hurt(w, c, dmg, x, y, nx, ny) {
+    dmg = Math.max(1, Math.round(dmg * rage(w)));
+    c.hp = Math.max(0, c.hp - dmg); c.inv = IFRAME; c.flash = 0.25;
+    const s = c.pts[0], kb = (70 + dmg * 9) * DT / ((1 + 0.6 * Math.min(2, c.feet)) * c.sc);   // 足が地面についていると、ふっ飛びにくい（体が大きいほど、さらに動かない）
+    s.px -= nx * kb; s.py -= ny * kb * 0.6;
+    w.ev.push({ k: 'hit', x, y, dmg, side: c.dir });
+  }
+
+  /* ---------- 世界を1コマ進める ---------- */
+  function stepWorld(w) {
+    const A = w.A, B = w.B;
+    for (let k = 0; k < SUB; k++) {
+      w.clock += DT;
+      integrate(w, A, B); integrate(w, B, A);
+      muscles(w, A); muscles(w, B);
+      constraints(A); constraints(B);
+      collide(w, A, B);
+      for (const c of [A, B]) { if (c.inv > 0) c.inv -= DT; if (c.flash > 0) c.flash -= DT; for (const bn of c.bones) if (bn.cd > 0) bn.cd -= DT; }
+    }
+    for (const d of w.debris) {
+      d.t += 1 / 60; d.vy += GRAV / 60; const mx = d.vx / 60, my = d.vy / 60; d.x1 += mx; d.x2 += mx; d.y1 += my; d.y2 += my;
+      const cx = (d.x1 + d.x2) / 2, cy = (d.y1 + d.y2) / 2, a = d.w / 60, cs = Math.cos(a), sn = Math.sin(a);
+      for (const k of [1, 2]) { const dx = d['x' + k] - cx, dy = d['y' + k] - cy; d['x' + k] = cx + dx * cs - dy * sn; d['y' + k] = cy + dx * sn + dy * cs; }
+      const low = Math.max(d.y1, d.y2); if (low > GY - 3) { const up = low - (GY - 3); d.y1 -= up; d.y2 -= up; d.vy *= -0.35; d.vx *= 0.7; d.w *= 0.6; }
+    }
+    if (w.debris.length) w.debris = w.debris.filter(d => d.t < 2.5);
+    if (w.active && !w.over) {
+      w.t += 1 / 60;
+      if (A.hp <= 0 || B.hp <= 0) finish(w, A.hp <= 0 && B.hp <= 0 ? 'draw' : A.hp <= 0 ? 'B' : 'A', 'ko');
+      else if (w.t >= w.limit) { const ra = A.hp / A.hpMax, rb = B.hp / B.hpMax; finish(w, Math.abs(ra - rb) < 1e-9 ? 'draw' : ra > rb ? 'A' : 'B', 'time'); }
+    }
+  }
+  function finish(w, who, how) {
+    w.over = { win: who, how, t: w.t };
+    for (const c of [w.A, w.B]) if (c.hp <= 0) { for (const bn of c.bones.slice()) if (bn.alive && bn.par < 0) breakBone(w, c, bn); }
+    w.ev.push({ k: 'over', win: who, how });
+  }
+  /* 最後まで一気に計算する（強さの調整やテスト用） */
+  function runBattle(specA, specB, opt) {
+    const w = makeWorld(specA, specB, opt); w.active = true;
+    let hits = 0, breaks = 0;
+    for (let i = 0; i < (w.limit + 2) * 60 && !w.over; i++) { stepWorld(w); for (const e of w.ev) { if (e.k === 'hit') hits++; else if (e.k === 'break') breaks++; } w.ev.length = 0; }
+    let bad = false; for (const c of [w.A, w.B]) for (const p of c.pts) if (!isFinite(p.x) || !isFinite(p.y)) bad = true;
+    return { win: w.over ? w.over.win : 'draw', how: w.over ? w.over.how : 'none', t: w.t, hpA: w.A.hp, hpB: w.B.hp, hits, breaks, bad };
+  }
+  return { GY, XL, XR, HOV, SKULL_R, TYPES, MAX_BONES, BASE, TIME_LIMIT, DT, rng, clamp, wrap, rage, makeCreature, makeWorld, stepWorld, runBattle };
+})();
+/* ============================================================
+   ホネツギ（仮題）：骨をつないで、自動で殴りあうゲーム
+   ============================================================ */
+
+/* ---------- 設定（ここを書き換えると調整できます） ---------- */
+const GAME_TITLE = 'ホネツギ';
+const TAGLINE = '骨をつないで、殴りあえ。';
+const HASHTAG = '#ホネツギ';
+const CREDIT = 'N.K. Works';
+const SHARE_URL = 'https://nkworks-games.github.io/honetsugi/';   // 公開URL（シェア文と挑戦リンクに使う）
+const START_BONES = { A: 2, L: 1 };   // 最初に持っている骨（背骨は最初から体についている）
+const SNAP_DEG = 15;                  // 骨の角度はこの刻みでそろえる
+const SAVE_BEST = 'hn_best', SAVE_RUN = 'hn_run2', SAVE_MUTE = 'hn_mute';
+
+const W = 360, H = 640;
+const { GY, HOV, TYPES, MAX_BONES, BASE } = SIM;
+const TY_ORDER = ['A', 'L', 'S', 'R', 'H', 'T', 'C'];
+const FONT = '"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic","Meiryo","Noto Sans CJK JP","Noto Sans JP",sans-serif';
+const FONT_T = '"Dela Gothic One",' + FONT;
+const PAL = { bg0: '#2a2350', bg1: '#17132b', ground: '#3b3266', ink: '#1b1630', bone: '#fff6e0', paper: '#fbf7ec', me: '#39d0c4', foe: '#ff5d73', yellow: '#ffd23f', orange: '#ff8a1f', dim: '#8f88b8' };
+const clamp = SIM.clamp, lerp = (a, b, t) => a + (b - a) * t, T = () => performance.now() / 1000;
+const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3), easeBack = t => { t = clamp(t, 0, 1); const c = 1.70158; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+
+/* ---------- 保存（使えない環境ではメモリ上だけで動く） ---------- */
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* 無視 */ } },
+  del(k) { try { localStorage.removeItem(k); } catch (e) { /* 無視 */ } },
+};
+
+/* ---------- 音（Web Audioで合成） ---------- */
+let AC = null, OUT = null, NOISE = null, muted = store.get(SAVE_MUTE, false);
+function audioInit() {
+  try {
+    if (!AC) {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      const b = AC.createBuffer(1, AC.sampleRate, AC.sampleRate), d = b.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      NOISE = b; OUT = AC.createGain(); OUT.gain.value = 0.8; OUT.connect(AC.destination);
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f1, f2, dur, type, vol, delay) {
+  if (!AC || muted) return;
+  try {
+    const t = AC.currentTime + (delay || 0), o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'sine'; o.frequency.setValueAtTime(f1, t); if (f2 !== f1) o.frequency.exponentialRampToValueAtTime(Math.max(1, f2), t + dur);
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(vol, t + 0.004); g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    o.connect(g); g.connect(OUT); o.start(t); o.stop(t + dur + 0.03);
+  } catch (e) { /* 無視 */ }
+}
+function noise(dur, vol, type, freq, delay) {
+  if (!AC || muted || !NOISE) return;
+  try {
+    const t = AC.currentTime + (delay || 0), s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+    s.buffer = NOISE; f.type = type || 'bandpass'; f.frequency.value = freq || 1500;
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    s.connect(f); f.connect(g); g.connect(OUT); s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.02);
+  } catch (e) { /* 無視 */ }
+}
+const semi = n => 523.25 * Math.pow(2, n / 12);
+let lastClack = 0;
+const sfx = {
+  ui() { tone(700, 700, 0.04, 'square', 0.04); },
+  pick() { tone(520, 780, 0.07, 'sine', 0.12); },
+  snap() { tone(1250, 900, 0.05, 'triangle', 0.16); noise(0.03, 0.12, 'highpass', 3000); },       // 骨が カチッ とはまる
+  off() { tone(500, 300, 0.09, 'triangle', 0.1); },
+  clack(v) { const n = T(); if (n - lastClack < 0.05) return; lastClack = n; const k = clamp(v / 500, 0.2, 1); tone(880 + Math.random() * 500, 620, 0.045, 'triangle', 0.05 + 0.08 * k); noise(0.03, 0.05 + 0.08 * k, 'bandpass', 2400); },
+  hit(d) { const k = clamp(d / 18, 0.3, 1); tone(240, 90, 0.16, 'sine', 0.2 + 0.2 * k); noise(0.09, 0.12 + 0.14 * k, 'lowpass', 900); tone(1300, 500, 0.07, 'square', 0.04); },
+  brk() { noise(0.14, 0.3, 'bandpass', 1800); tone(400, 120, 0.14, 'sawtooth', 0.08); tone(1500, 700, 0.06, 'triangle', 0.1, 0.02); },
+  go() { tone(semi(0), semi(0), 0.12, 'square', 0.06); tone(semi(7), semi(7), 0.2, 'square', 0.06, 0.12); },
+  win() { [0, 4, 7, 12, 16].forEach((n, i) => tone(semi(n), semi(n), 0.2, 'square', 0.055, i * 0.09)); tone(semi(19), semi(19), 0.5, 'triangle', 0.09, 0.45); },
+  lose() { [7, 5, 2, -2].forEach((n, i) => tone(semi(n - 12), semi(n - 12), 0.26, 'triangle', 0.1, i * 0.16)); },
+  ko() { noise(0.35, 0.4, 'lowpass', 500); tone(180, 40, 0.5, 'sine', 0.45); },
+  get() { [12, 16, 19].forEach((n, i) => tone(semi(n), semi(n), 0.12, 'triangle', 0.1, i * 0.06)); },
+  boss() { tone(98, 92, 0.7, 'sawtooth', 0.12); tone(73.4, 69, 0.9, 'sawtooth', 0.12, 0.25); noise(0.6, 0.12, 'lowpass', 300); [0, 0.35, 0.7].forEach(d => tone(196, 185, 0.22, 'square', 0.05, d)); },   // ボス登場
+};
+
+/* ============================================================
+   骨の体のデータ（組み立て）
+   build = [[種類, 親(−1はドクロ), 角度(度)], ...]  ※ sim.js の spec.bones と同じ形
+   先頭（0番）はいつも「体の芯の背骨」。全員が最初から持っていて、外せない・動かせない・折れない
+   ============================================================ */
+const newBuild = () => [BASE.slice()];                    // ドクロ＋背骨だけの体
+const nBones = b => Math.max(0, (b ? b.length : 0) - 1);  // つないだ骨の本数（背骨は数えない）
+const isBaseBuild = b => Array.isArray(b) && b.length > 0 && b[0][0] === BASE[0] && b[0][1] === BASE[1] && b[0][2] === BASE[2];
+function poseOf(bones, x0, y0, dir, time, amp, sc) {   // 物理なしで、今のポーズ（線の集まり）を作る。組み立て画面や小さな絵に使う。sc＝体の大きさ（ボスは1より大きい）
+  sc = sc || 1; const segs = [], abs = [], end = [];
+  bones.forEach(([ty, par, deg], i) => {
+    const t = TYPES[ty], a = (par < 0 ? 0 : abs[par]) + deg * Math.PI / 180 + (amp ? amp * t.amp * Math.sin(t.w * time + i * 2.1) : 0);
+    abs.push(a);
+    const p = par < 0 ? [x0, y0] : end[par], wa = dir > 0 ? a : Math.PI - a, L = t.L * sc;
+    const q = [p[0] + Math.cos(wa) * L, p[1] + Math.sin(wa) * L];
+    end.push(q); segs.push({ x1: p[0], y1: p[1], x2: q[0], y2: q[1], ty, i, par });
+  });
+  return { segs, skull: { x: x0, y: y0 }, dir, abs, sc };
+}
+function boundsOf(bones, sc) {                    // 体の大きさ（小さな絵を枠に収める時に使う）
+  sc = sc || 1; const p = poseOf(bones, 0, 0, 1, 0, 0, sc), m = 16 * sc, e = 8 * sc; let x0 = -m, x1 = m, y0 = -m, y1 = m;
+  for (const s of p.segs) { x0 = Math.min(x0, s.x2 - e); x1 = Math.max(x1, s.x2 + e); y0 = Math.min(y0, s.y2 - e); y1 = Math.max(y1, s.y2 + e); }
+  return { x0, x1, y0, y1 };
+}
+function subtreeOf(bones, i) { const out = [i]; for (let k = i + 1; k < bones.length; k++) if (out.indexOf(bones[k][1]) >= 0) out.push(k); return out; }
+function removeBone(bones, i) {                   // 骨 i と、その先につながる骨を外す。外した種類の一覧を返す
+  const gone = subtreeOf(bones, i), types = gone.map(k => bones[k][0]), map = [];
+  let n = 0; for (let k = 0; k < bones.length; k++) map.push(gone.indexOf(k) >= 0 ? -2 : n++);
+  const kept = bones.filter((b, k) => map[k] >= 0).map(b => [b[0], b[1] < 0 ? -1 : map[b[1]], b[2]]);
+  bones.length = 0; kept.forEach(b => bones.push(b));
+  return types;
+}
+/* 挑戦リンク用：体を短い文字にする／もどす（1本＝3文字：種類・親・角度。背骨は全員同じなので入れない）
+   親の文字は 0＝ドクロ、1＝背骨の先、2〜＝つないだ骨 */
+function encodeBuild(bones) { return '2' + bones.slice(1).map(([ty, par, deg]) => ty + (par + 1).toString(36) + Math.round((((deg % 360) + 540) % 360) / SNAP_DEG).toString(36)).join(''); }
+function decodeBuild(s) {
+  if (typeof s !== 'string' || s[0] !== '2' || (s.length - 1) % 3) return null;
+  const out = newBuild();
+  for (let i = 1; i < s.length && out.length < MAX_BONES + 1; i += 3) {
+    const ty = s[i], par = parseInt(s[i + 1], 36) - 1, a = parseInt(s[i + 2], 36);
+    if (!TYPES[ty] || !(par >= -1) || par >= out.length || !(a >= 0 && a < 24)) return null;
+    out.push([ty, par, a * SNAP_DEG - 180]);
+  }
+  return out;
+}
+
+/* ============================================================
+   相手（CPU）の骨。だんだん骨が増え、体力も上がる
+   ============================================================ */
+/* hp＝体力  pw＝攻撃の強さ（1より小さいと手加減。自動対戦で勝率を測って決めた値）
+   boss＝ボス（3戦ごとに出る。勝つと骨を2本もらえる）  scale＝体の大きさ（ボスだけ大きい）
+   どの相手も、先頭に「体の芯の背骨」B0 を持つ。親の番号は 0＝背骨の先（腰）、−1＝ドクロ */
+const B0 = ['S', -1, 90];
+const ROSTER = [
+  { name: 'ほねっこ', hp: 45, pw: 0.2, bones: [B0, ['A', -1, -10]] },
+  { name: 'あしながくん', hp: 70, pw: 1.05, bones: [B0, ['L', 0, 0], ['A', -1, -20]] },
+  { name: 'おおぼね大将', boss: true, scale: 1.25, hp: 150, pw: 0.75, bones: [B0, ['A', -1, -25], ['A', -1, 20], ['L', 0, -15], ['L', 0, 15]] },
+  { name: 'ツノぼうや', hp: 85, pw: 0.8, bones: [B0, ['H', -1, 0], ['L', 0, 15], ['A', -1, -45], ['L', 0, -15]] },
+  { name: 'ムチねえさん', hp: 95, pw: 2.3, bones: [B0, ['T', -1, -30], ['T', -1, 15], ['L', 0, -15], ['L', 0, 20], ['T', -1, -75]] },
+  { name: 'こんぼう親方', boss: true, scale: 1.35, hp: 200, pw: 0.5, bones: [B0, ['S', -1, -60], ['C', 1, 45], ['L', 0, -15], ['L', 0, 15], ['R', -1, 30], ['A', -1, -5], ['H', -1, -30]] },
+  { name: 'アバラ番長', hp: 115, pw: 1.35, bones: [B0, ['R', -1, 45], ['A', -1, -35], ['A', -1, 0], ['L', 0, -20], ['L', 0, 20], ['S', -1, -90], ['A', 6, 70]] },
+  { name: '千手ボーン', hp: 125, pw: 1.75, bones: [B0, ['S', -1, -90], ['A', 1, 60], ['A', 1, 110], ['A', -1, -25], ['A', -1, 20], ['L', 0, -15], ['L', 0, 20], ['A', 1, 20]] },
+  { name: 'サソリ大王', boss: true, scale: 1.4, hp: 270, pw: 0.65, bones: [B0, ['S', -1, -120], ['T', 1, 60], ['H', 2, 75], ['A', -1, -20], ['H', 4, 30], ['A', -1, 25], ['H', 6, -30], ['L', 0, -25], ['L', 0, 0], ['L', 0, 25]] },
+  { name: 'ノッポ伯爵', hp: 140, pw: 0.7, bones: [B0, ['S', 0, 0], ['L', 1, -15], ['L', 1, 15], ['C', -1, 45], ['T', -1, 20], ['R', -1, 75], ['H', -1, 0], ['A', 0, -70], ['A', -1, -30], ['T', -1, -60]] },
+  { name: 'ヨロイ将軍', hp: 150, pw: 0.6, bones: [B0, ['R', -1, -60], ['R', -1, 60], ['R', -1, 0], ['H', 3, 0], ['L', 0, -20], ['L', 0, 20], ['C', -1, -30], ['A', -1, 30], ['S', -1, -90], ['H', 9, 60], ['L', 0, 0]] },
+  { name: 'ホネ魔王', boss: true, scale: 1.5, hp: 320, pw: 0.7, bones: [B0, ['R', -1, -40], ['R', -1, 40], ['H', -1, 0], ['S', -1, -90], ['C', 4, 70], ['T', 4, 120], ['A', -1, -15], ['A', -1, 15], ['L', 0, -25], ['L', 0, 25], ['H', 4, 0], ['L', 0, 0]] },
+];
+/* 12戦を過ぎた後（13戦目〜）に出てくる相手：ふつうの相手2体 → ボス、をくり返す。
+   6戦でひとまわり。ひとまわりするごとに、体力と攻撃が上がる。ref＝上の ROSTER の何番目の体を使うか */
+const AFTER = [
+  { name: 'ふたごこんぼう', hp: 185, pw: 0.6, bones: [B0, ['S', -1, -75], ['C', 1, 60], ['S', -1, -110], ['C', 3, 100], ['L', 0, -25], ['L', 0, 0], ['L', 0, 25], ['R', -1, 20], ['R', -1, -20], ['H', -1, 0], ['T', -1, 45]] },
+  { ref: 9, hp: 200, pw: 1.1 },     // ノッポ伯爵・改
+  { ref: 8, hp: 365, pw: 0.95 },     // ボス：サソリ大王・改
+  { ref: 10, hp: 230, pw: 0.9 },    // ヨロイ将軍・改
+  { ref: 7, hp: 245, pw: 3.0 },     // 千手ボーン・改
+  { ref: 11, hp: 410, pw: 1.15 },    // ボス：ホネ魔王・改
+];
+const enemyOf = (e, round) => ({ name: e.name, hp: e.hp, pw: e.pw, bones: e.bones, boss: !!e.boss, scale: e.scale || 1, round });
+/* 第round戦の相手。3戦ごと（3・6・9・12…）がボス */
+function isBossRound(round) { return round % 3 === 0; }
+function enemyFor(round) {
+  const n = ROSTER.length;
+  if (round <= n) return enemyOf(ROSTER[round - 1], round);
+  const k = round - n - 1, lap = Math.floor(k / AFTER.length), a = AFTER[k % AFTER.length], e = a.ref != null ? ROSTER[a.ref] : a;
+  const o = enemyOf(e, round), kai = Math.min(3, lap + (a.ref != null ? 1 : 0));
+  if (kai > 0) o.name = e.name + '・' + '改'.repeat(kai);
+  o.hp = a.hp + 60 * lap; o.pw = Math.min(4, Math.round(a.pw * (1 + 0.15 * lap) * 100) / 100);
+  return o;
+}
+
+/* ============================================================
+   状態
+   ============================================================ */
+const G = {
+  screen: 'title',             // title | how | build | battle | reward | over
+  mode: 'run',                 // run（連勝） | challenge（挑戦リンク）
+  round: 1, wins: 0, inv: {}, build: [],
+  foe: null, world: null, speed: 1, phase: '', pt: 0, endT: 0, result: null,
+  drag: null, sel: -1, info: '', toast: null, press: null, fx: [], shake: 0,
+  camY: 0, camTo: 0,           // 組み立て画面を上下にずらした量（プラス＝下の方を見ている）
+  best: store.get(SAVE_BEST, 0), newBest: false, challenge: null, cBudget: 0, shareBlob: null, demo: null, reward: null, t0: 0,
+};
+const BOSS_REWARD = 2;                  // ボスに勝った時にもらえる骨の本数
+const BOSS_INFO = 'ボス戦！ 体が大きくて、ドクロの位置が高い。\n勝つと 骨を2本 もらえる';
+const freshInv = () => { const o = {}; TY_ORDER.forEach(k => { o[k] = START_BONES[k] || 0; }); return o; };
+function saveRun() { if (G.mode === 'run') store.set(SAVE_RUN, { round: G.round, wins: G.wins, inv: G.inv, build: G.build }); }
+function loadRun() { const r = store.get(SAVE_RUN, null); return r && r.round >= 1 && isBaseBuild(r.build) && r.inv ? r : null; }
+function newRun() { G.mode = 'run'; G.round = 1; G.wins = 0; G.inv = freshInv(); G.build = newBuild(); G.newBest = false; store.del(SAVE_RUN); gotoBuild(); }
+function continueRun() { const r = loadRun(); if (!r) return newRun(); G.mode = 'run'; G.round = r.round; G.wins = r.wins; G.inv = Object.assign(freshInv(), r.inv); G.build = r.build.filter(b => TYPES[b[0]]); G.newBest = false; gotoBuild(); }
+function startChallenge() { G.mode = 'challenge'; G.cBudget = Math.max(3, nBones(G.challenge)); G.inv = {}; TY_ORDER.forEach(k => { G.inv[k] = 99; }); G.build = newBuild(); gotoBuild(); }
+function gotoBuild() {
+  G.screen = 'build'; G.sel = -1; G.drag = null; G.t0 = T();
+  G.foe = G.mode === 'run' ? enemyFor(G.round) : { name: '挑戦状の骨', bones: G.challenge, hp: 100, pw: 1, boss: false, scale: 1 };
+  G.info = !nBones(G.build) ? '下の骨を、ドクロや背骨の先まで指で運んでつなごう' : G.foe.boss ? BOSS_INFO : '';
+  G.camY = G.camTo = fitCam();                     // 体がはみ出していたら、見える位置から始める
+  saveRun();
+}
+const boneCap = () => G.mode === 'challenge' ? Math.min(MAX_BONES, G.cBudget) : MAX_BONES;
+function startBattle() {
+  if (G.screen !== 'build') return;
+  G.world = SIM.makeWorld({ bones: G.build }, { bones: G.foe.bones, scale: G.foe.scale, boss: G.foe.boss }, { seed: (Math.random() * 1e9) | 0, hpB: G.foe.hp, pwB: G.foe.pw || 1 });
+  G.screen = 'battle'; G.phase = 'intro'; G.pt = 0; G.fx = []; G.shake = 0; G.result = null; G.endT = 0; G.shareBlob = null;
+  if (G.foe.boss) sfx.boss();
+}
+function onBattleEnd(win) {            // win: 'A'（自分）| 'B' | 'draw'
+  G.result = win;
+  if (win === 'A') sfx.win(); else if (win === 'B') sfx.lose();
+}
+function afterBattle() {
+  const win = G.result;
+  if (win === 'draw') { toast('引き分け！ もう一度'); gotoBuild(); return; }
+  if (G.mode === 'challenge') { G.screen = 'over'; G.t0 = T(); makeShareBlob(); return; }
+  if (win === 'A') {
+    G.wins++; if (G.wins > G.best) { G.best = G.wins; G.newBest = true; store.set(SAVE_BEST, G.best); }
+    const kinds = []; G.foe.bones.slice(1).forEach(b => { if (kinds.indexOf(b[0]) < 0) kinds.push(b[0]); });   // 体の芯の背骨は もらえない
+    G.reward = { kinds: TY_ORDER.filter(k => kinds.indexOf(k) >= 0), need: G.foe.boss ? BOSS_REWARD : 1, picks: [] }; G.screen = 'reward'; G.t0 = T();   // ボスに勝つと2本
+  } else { store.del(SAVE_RUN); G.screen = 'over'; G.t0 = T(); makeShareBlob(); }
+}
+function takeReward(tys) {              // もらう骨（ふつうは1本、ボスの後は2本）を手持ちに足して、次の戦いへ
+  tys = (Array.isArray(tys) ? tys : [tys]).filter(ty => TYPES[ty]); if (!tys.length) return;
+  tys.forEach(ty => { G.inv[ty] = (G.inv[ty] || 0) + 1; }); G.round++; sfx.get(); gotoBuild();
+  const nm = tys.map(ty => TYPES[ty].name), got = nm.length > 1 ? (nm[0] === nm[1] ? `${nm[0]} を2本 手に入れた！` : `${nm[0]} と ${nm[1]} を手に入れた！`) : `${nm[0]} を手に入れた！`;
+  G.info = got + (G.foe.boss ? '\nつぎはボス戦（勝つと 骨を2本 もらえる）' : nm.length > 1 ? '\nつないで強くしよう' : ' つないで強くしよう');
+}
+
+/* ============================================================
+   描画
+   ============================================================ */
+const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
+let UI = [];
+function rrP(c, x, y, w, h, r) { c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r); c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath(); }   // 角の丸い四角（今の線に足す）
+function rr(c, x, y, w, h, r) { c.beginPath(); rrP(c, x, y, w, h, r); }
+function text(c, s, x, y, size, col, o) {
+  o = o || {}; c.save(); c.font = `${o.w || 800} ${size}px ${o.title ? FONT_T : FONT}`; c.textAlign = o.align || 'center'; c.textBaseline = 'middle';
+  if (o.a != null) c.globalAlpha *= o.a;
+  if (o.stroke) { c.lineJoin = 'round'; c.lineWidth = o.sw || 4; c.strokeStyle = o.stroke; c.strokeText(s, x, y); }
+  c.fillStyle = col; c.fillText(s, x, y); c.restore();
+}
+function wrapText(c, s, maxW, size) { c.save(); c.font = `800 ${size}px ${FONT}`; const lines = []; let cur = ''; for (const ch of s) { if (ch === '\n') { lines.push(cur); cur = ''; continue; } if (cur && c.measureText(cur + ch).width > maxW && '、。！？）」…'.indexOf(ch) < 0) { lines.push(cur); cur = ch; } else cur += ch; } if (cur) lines.push(cur); c.restore(); return lines; }
+
+/* 背景（夜の墓場ふう。一度だけ描いて使い回す） */
+let bgCache = null;
+function drawBg(c) {
+  if (!bgCache) {
+    const cv = document.createElement('canvas'); cv.width = W * 2; cv.height = H * 2; const b = cv.getContext('2d'); b.scale(2, 2);
+    const g = b.createLinearGradient(0, 0, 0, H); g.addColorStop(0, PAL.bg0); g.addColorStop(0.7, '#1f1a3d'); g.addColorStop(1, PAL.bg1); b.fillStyle = g; b.fillRect(0, 0, W, H);
+    const r = SIM.rng(11); b.fillStyle = '#fff';
+    for (let i = 0; i < 46; i++) { b.globalAlpha = 0.15 + r() * 0.5; const s = 0.6 + r() * 1.3; b.fillRect(r() * W, r() * 300, s, s); }
+    b.globalAlpha = 1; b.fillStyle = '#ffe9a8'; b.beginPath(); b.arc(308, 286, 26, 0, Math.PI * 2); b.fill();
+    b.fillStyle = 'rgba(42,35,80,0.55)'; b.beginPath(); b.arc(318, 279, 22, 0, Math.PI * 2); b.fill();
+    b.fillStyle = '#231d44';                      // 遠くの丘と墓
+    b.beginPath(); b.moveTo(0, GY); b.quadraticCurveTo(90, GY - 46, 190, GY - 14); b.quadraticCurveTo(280, GY - 44, 360, GY - 8); b.lineTo(360, GY); b.closePath(); b.fill();
+    [[40, 26], [128, 18], [236, 24], [322, 16]].forEach(([x, h], i) => { const y = GY - (i % 2 ? 18 : 30); rr(b, x - 8, y - h, 16, h + 6, 7); b.fill(); });
+    b.fillStyle = PAL.ground; b.fillRect(0, GY, W, H - GY);
+    b.fillStyle = '#4a3f7d'; b.fillRect(0, GY, W, 4);
+    b.fillStyle = 'rgba(0,0,0,0.16)'; for (let i = 0; i < 30; i++) b.fillRect(r() * W, GY + 10 + r() * 190, 8 + r() * 26, 2);
+    bgCache = cv;
+  }
+  c.drawImage(bgCache, 0, 0, W, H);
+}
+
+/* 骨を1本描く（種類ごとに形がちがう） */
+function drawBone(c, x1, y1, x2, y2, ty, team, o) {
+  o = o || {};
+  const k = o.k || 1, t = TYPES[ty], dx = x2 - x1, dy = y2 - y1, L = Math.hypot(dx, dy) || 1, a = Math.atan2(dy, dx), r = t.r * k;   // k＝体の大きさ
+  const edge = o.edge || (team > 0 ? '#12324a' : '#4a1230'), fill = o.fill || (team > 0 ? '#f3fbff' : '#fff0ea');
+  c.save(); c.translate(x1, y1); c.rotate(a); c.lineJoin = 'round'; c.lineCap = 'round';
+  const path = () => {
+    c.beginPath();
+    if (ty === 'H') { c.moveTo(0, -r - 1.5 * k); c.lineTo(L + 3 * k, 0); c.lineTo(0, r + 1.5 * k); c.closePath(); }
+    else if (ty === 'T') { for (let i = 0; i < 7; i++) { const u = (i + 0.5) / 7, rad = r * (1.35 - u * 0.75); c.moveTo(u * L + rad, 0); c.arc(u * L, 0, rad, 0, Math.PI * 2); } }
+    else if (ty === 'S') { for (let i = 0; i < 4; i++) { const u = (i + 0.5) / 4; rrP(c, u * L - L / 8 + 1, -r - 1.5 * k, L / 4 - 2, 2 * r + 3 * k, 3 * k); } }
+    else if (ty === 'R') { c.moveTo(0, -r); c.quadraticCurveTo(L * 0.5, -r - 5 * k, L, -r * 0.7); c.arc(L, 0, r * 0.7, -Math.PI / 2, Math.PI / 2); c.quadraticCurveTo(L * 0.5, r + 5 * k, 0, r); c.arc(0, 0, r, Math.PI / 2, -Math.PI / 2); c.closePath(); }
+    else {
+      const kb = ty === 'C' ? r * 1.25 : r * 0.95, ka = ty === 'C' ? r * 0.75 : r * 0.95, sh = ty === 'C' ? r * 0.55 : r * 0.62;
+      c.moveTo(0, -sh); c.lineTo(L, -sh); c.lineTo(L, sh); c.lineTo(0, sh); c.closePath();
+      c.moveTo(ka, -sh * 0.9); c.arc(0, -sh * 0.9, ka, 0, Math.PI * 2); c.moveTo(ka, sh * 0.9); c.arc(0, sh * 0.9, ka, 0, Math.PI * 2);
+      c.moveTo(L + kb, -sh * 0.9); c.arc(L, -sh * 0.9, kb, 0, Math.PI * 2); c.moveTo(L + kb, sh * 0.9); c.arc(L, sh * 0.9, kb, 0, Math.PI * 2);
+    }
+  };
+  path(); c.strokeStyle = edge; c.lineWidth = 4.5; c.stroke(); c.fillStyle = fill; c.fill();
+  if (ty === 'R') { c.strokeStyle = edge; c.globalAlpha *= 0.3; c.lineWidth = 1.6; for (let i = 1; i < 4; i++) { c.beginPath(); c.moveTo(L * i / 4, -r - 1); c.lineTo(L * i / 4, r + 1); c.stroke(); } }
+  if (ty === 'L') {                               // 足先
+    c.restore(); c.save(); c.translate(x2, y2);
+    c.beginPath(); c.ellipse((o.dir || team) * 5 * k, k, 9 * k, 5 * k, 0, 0, Math.PI * 2); c.strokeStyle = edge; c.lineWidth = 4.5; c.stroke(); c.fillStyle = fill; c.fill();
+  }
+  c.restore();
+}
+function drawSkull(c, x, y, dir, team, o) {
+  o = o || {}; const k = o.k || 1, R = SIM.SKULL_R, edge = team > 0 ? '#12324a' : '#4a1230', fill = o.flash ? '#ffd0d0' : (team > 0 ? '#f3fbff' : '#fff0ea'), eye = team > 0 ? PAL.me : PAL.foe;   // k＝体の大きさ
+  c.save(); c.translate(x, y); if (o.rot) c.rotate(o.rot); c.scale(dir * 1.12 * k, 1.12 * k); c.lineJoin = 'round'; c.lineCap = 'round';
+  const shape = () => { c.beginPath(); c.arc(0, -3, R - 1, 0, Math.PI * 2); rrP(c, -6, 5, 15, 10, 3.5); };
+  shape(); c.strokeStyle = edge; c.lineWidth = 4.5 / k; c.stroke(); c.fillStyle = fill; c.fill();
+  c.fillStyle = edge; c.strokeStyle = edge;
+  if (o.dead) { c.lineWidth = 2.4; [[-3, -4], [7, -4]].forEach(([ex, ey]) => { c.beginPath(); c.moveTo(ex - 3, ey - 3); c.lineTo(ex + 3, ey + 3); c.moveTo(ex + 3, ey - 3); c.lineTo(ex - 3, ey + 3); c.stroke(); }); }
+  else {
+    c.beginPath(); c.ellipse(-3.5, -4, 4.3, 5.2, 0, 0, Math.PI * 2); c.fill(); c.beginPath(); c.ellipse(7, -4, 4.3, 5.2, 0, 0, Math.PI * 2); c.fill();
+    c.fillStyle = eye; c.beginPath(); c.arc(-2.3, -4, 2, 0, Math.PI * 2); c.fill(); c.beginPath(); c.arc(8.2, -4, 2, 0, Math.PI * 2); c.fill();
+  }
+  c.fillStyle = edge; c.beginPath(); c.moveTo(2.5, 1); c.lineTo(4.6, 5); c.lineTo(0.6, 5); c.closePath(); c.fill();
+  c.lineWidth = 1.5; c.beginPath(); for (let i = -2; i <= 6; i += 4) { c.moveTo(i, 9.5); c.lineTo(i, 14.5); } c.stroke();
+  if (o.crack) { c.lineWidth = 1.5; c.beginPath(); c.moveTo(-9, -15); c.lineTo(-5, -10); c.lineTo(-8, -6); if (o.crack > 1) { c.moveTo(10, -15); c.lineTo(7, -10); c.lineTo(11, -6); } c.stroke(); }
+  if (o.crown) {                                  // ボスのしるし：王冠
+    c.beginPath(); c.moveTo(-10, -13.5); c.lineTo(-12, -26); c.lineTo(-5.5, -20); c.lineTo(0, -29); c.lineTo(5.5, -20); c.lineTo(12, -26); c.lineTo(10, -13.5); c.closePath();
+    c.lineWidth = 3.6 / k; c.strokeStyle = edge; c.stroke(); c.fillStyle = PAL.yellow; c.fill();
+    c.fillStyle = PAL.foe; c.beginPath(); c.arc(0, -18, 1.9, 0, Math.PI * 2); c.fill();
+  }
+  c.restore();
+}
+function drawPose(c, p, team, o) {               // poseOf の結果を描く
+  o = o || {};
+  for (const s of p.segs) drawBone(c, s.x1, s.y1, s.x2, s.y2, s.ty, team, { dir: p.dir, k: p.sc, fill: o.hi === s.i ? '#ffe98a' : null });
+  drawSkull(c, p.skull.x, p.skull.y, p.dir, team, Object.assign({ k: p.sc, crown: !!o.boss }, o.skull));
+}
+function drawMini(c, bones, cx, cy, w, h, team, dir, time, o) {   // 枠に収まる大きさで、体の小さな絵を描く。o.sc＝体の大きさ o.boss＝王冠つき
+  o = o || {}; const sc = o.sc || 1, b = boundsOf(bones, sc); if (o.boss) b.y0 -= 18 * sc;   // 王冠のぶん、上をあける
+  const k = Math.min(1, w / (b.x1 - b.x0), h / (b.y1 - b.y0));
+  c.save(); c.translate(cx, cy); c.scale(k, k);
+  const ox = -(b.x0 + b.x1) / 2 * dir, oy = -(b.y0 + b.y1) / 2;
+  drawPose(c, poseOf(bones, ox, oy, dir, time || 0, time ? 0.4 : 0, sc), team, { boss: o.boss }); c.restore();
+}
+function drawCreature(c, cr, team, now) {          // 戦闘中の体（物理の結果）を描く
+  const P = cr.pts;
+  for (const bn of cr.bones) if (bn.alive) { const a = P[bn.a], b = P[bn.b]; drawBone(c, a.x, a.y, b.x, b.y, bn.ty, team, { dir: cr.dir, k: cr.sc, fill: bn.dur < bn.durMax * 0.35 ? (team > 0 ? '#cfe3ee' : '#f0d3cb') : null }); }
+  const r = cr.hp / cr.hpMax;
+  drawSkull(c, P[0].x, P[0].y, cr.dir, team, { k: cr.sc, crown: cr.boss, flash: cr.flash > 0, dead: cr.hp <= 0, crack: r < 0.34 ? 2 : r < 0.67 ? 1 : 0 });
+}
+
+/* ---------- ボタン ---------- */
+function hit(id, x, y, w, h, fn, enabled) { UI.push({ id, x, y, w, h, fn, enabled: enabled !== false }); }
+function button(id, x, y, w, h, label, kind, fn, o) {
+  o = o || {}; const enabled = o.enabled !== false; hit(id, x, y, w, h, fn, enabled);
+  const pressed = G.press && G.press.id === id && T() - G.press.t < 0.12, dy = pressed ? 2 : 0;
+  const S = { primary: [PAL.orange, '#fff'], secondary: [PAL.paper, PAL.ink], ghost: ['rgba(255,255,255,0.10)', '#fff'], me: [PAL.me, PAL.ink] }[kind] || [PAL.paper, PAL.ink];
+  ctx.save(); if (!enabled) ctx.globalAlpha = 0.4;
+  const rad = Math.min(16, h * 0.36);
+  if (kind !== 'ghost') { ctx.fillStyle = PAL.ink; rr(ctx, x, y + 3, w, h, rad); ctx.fill(); }
+  ctx.fillStyle = S[0]; ctx.strokeStyle = kind === 'ghost' ? 'rgba(255,255,255,0.5)' : PAL.ink; ctx.lineWidth = 2.5; rr(ctx, x, y + dy, w, h, rad); ctx.fill(); ctx.stroke();
+  text(ctx, label, x + w / 2, y + dy + h / 2 + 1, o.size || Math.round(h * 0.4), S[1]);
+  ctx.restore();
+}
+function soundButton(x, y) {
+  hit('snd', x, y, 34, 34, () => { muted = !muted; store.set(SAVE_MUTE, muted); if (!muted) sfx.ui(); });
+  ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.beginPath(); ctx.arc(x + 17, y + 17, 15, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = ctx.fillStyle = '#fff'; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; const cx = x + 14, cy = y + 17;
+  ctx.beginPath(); ctx.moveTo(cx - 6, cy - 3); ctx.lineTo(cx - 2, cy - 3); ctx.lineTo(cx + 3, cy - 7); ctx.lineTo(cx + 3, cy + 7); ctx.lineTo(cx - 2, cy + 3); ctx.lineTo(cx - 6, cy + 3); ctx.closePath(); ctx.fill();
+  if (!muted) { ctx.beginPath(); ctx.arc(cx + 3, cy, 5, -0.8, 0.8); ctx.stroke(); ctx.beginPath(); ctx.arc(cx + 3, cy, 9, -0.8, 0.8); ctx.stroke(); }
+  else { ctx.beginPath(); ctx.moveTo(cx + 7, cy - 4); ctx.lineTo(cx + 13, cy + 4); ctx.moveTo(cx + 13, cy - 4); ctx.lineTo(cx + 7, cy + 4); ctx.stroke(); }
+  ctx.restore();
+}
+function toast(msg) { G.toast = { msg, t0: T() }; }
+function drawToast(now) {
+  if (!G.toast) return; const a = now - G.toast.t0; if (a > 2.4) { G.toast = null; return; }
+  const al = a < 0.15 ? a / 0.15 : a > 2 ? (2.4 - a) / 0.4 : 1, lines = wrapText(ctx, G.toast.msg, 270, 13), h = 16 + lines.length * 18;
+  ctx.save(); ctx.globalAlpha = clamp(al, 0, 1); ctx.fillStyle = PAL.ink; rr(ctx, 30, 60, 300, h, 14); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.stroke();
+  lines.forEach((ln, i) => text(ctx, ln, 180, 60 + 8 + 9 + i * 18, 13, '#fff')); ctx.restore();
+}
+function panel(x, y, w, h, o) { o = o || {}; ctx.save(); ctx.fillStyle = PAL.ink; rr(ctx, x, y + 3, w, h, 14); ctx.fill(); ctx.fillStyle = o.fill || PAL.paper; ctx.strokeStyle = PAL.ink; ctx.lineWidth = 2.5; rr(ctx, x, y, w, h, 14); ctx.fill(); ctx.stroke(); ctx.restore(); }
+function titleText(s, x, y, size, rot, col) { ctx.save(); ctx.translate(x, y); ctx.rotate(rot || 0); text(ctx, s, 3, 4, size, PAL.ink, { title: true, w: 400 }); text(ctx, s, 0, 0, size, col || PAL.bone, { title: true, w: 400, stroke: PAL.ink, sw: 8 }); ctx.restore(); }
+
+/* ---------- タイトル ---------- */
+function demoStep() {                              // タイトルの後ろで、CPUどうしが戦い続ける
+  if (!G.demo || (G.demo.over && G.demo.t > G.demo.over.t + 1.6)) { const a = enemyFor(1 + ((Math.random() * 9) | 0)), b = enemyFor(1 + ((Math.random() * 9) | 0)); G.demo = SIM.makeWorld({ bones: a.bones, scale: a.scale, boss: a.boss }, { bones: b.bones, scale: b.scale, boss: b.boss }, { seed: (Math.random() * 1e9) | 0 }); G.demo.active = true; }
+  SIM.stepWorld(G.demo); if (G.demo.over) G.demo.t += 1 / 60; G.demo.ev.length = 0;
+}
+function drawWorldBodies(w, now) {
+  for (const d of w.debris) { ctx.save(); ctx.globalAlpha = clamp((2.5 - d.t) / 0.6, 0, 1); drawBone(ctx, d.x1, d.y1, d.x2, d.y2, d.ty, d.side, { k: d.sc }); ctx.restore(); }
+  drawCreature(ctx, w.B, -1, now); drawCreature(ctx, w.A, 1, now);
+}
+function drawTitle(now) {
+  drawBg(ctx); if (G.demo) drawWorldBodies(G.demo, now);
+  ctx.fillStyle = 'rgba(23,19,43,0.45)'; ctx.fillRect(0, 0, W, 250);
+  soundButton(W - 44, 10);
+  titleText(GAME_TITLE, 180, 104, 70, -0.04);
+  text(ctx, TAGLINE, 180, 164, 16, '#fff', { stroke: PAL.ink, sw: 5 });
+  text(ctx, '勝つと 相手の骨をもらえる。3戦ごとに ボスがくる！', 180, 190, 12, '#d9d4f5', { stroke: PAL.ink, sw: 4 });
+  if (G.challenge) {
+    panel(24, 452, 312, 172);
+    text(ctx, '挑戦状が とどいた！', 180, 474, 17, PAL.ink);
+    drawMini(ctx, G.challenge, 96, 536, 120, 84, -1, -1, now);
+    text(ctx, `骨 ${nBones(G.challenge)}本`, 96, 596, 12, PAL.ink);
+    button('ch', 172, 494, 150, 50, '挑戦する', 'primary', startChallenge, { size: 19 });
+    button('run', 172, 556, 150, 40, '連勝モード', 'secondary', () => { loadRun() ? continueRun() : newRun(); }, { size: 14 });
+  } else {
+    const run = loadRun();
+    if (run) { button('cont', 60, 476, 240, 56, `つづきから（${run.wins}連勝中）`, 'primary', continueRun, { size: 18 }); button('new', 60, 544, 116, 40, 'はじめから', 'secondary', newRun, { size: 14 }); button('how', 184, 544, 116, 40, 'あそびかた', 'secondary', () => { G.screen = 'how'; }, { size: 14 }); }
+    else { button('new', 60, 480, 240, 60, 'はじめる', 'primary', newRun, { size: 24 }); button('how', 100, 552, 160, 40, 'あそびかた', 'secondary', () => { G.screen = 'how'; }, { size: 14 }); }
+    if (G.best > 0) text(ctx, `最高 ${G.best}連勝`, 180, 610, 13, PAL.yellow, { stroke: PAL.ink, sw: 4 });
+  }
+  text(ctx, CREDIT, 180, 630, 10, PAL.dim);
+}
+function drawHow(now) {
+  drawBg(ctx); ctx.fillStyle = 'rgba(23,19,43,0.6)'; ctx.fillRect(0, 0, W, H);
+  titleText('あそびかた', 180, 56, 32, -0.02);
+  const rows = [['1', '骨をつなぐ', '下の骨を指で運び、ドクロや骨の先につなぐ\n体が長くなったら、画面を上下にスワイプ'], ['2', '自動で戦う', '「たたかう」を押すと勝手に殴りあう。\n相手のドクロの体力を0にしたら勝ち'], ['3', '骨をもらう', '勝つと相手の骨を1本もらえる。\n3戦ごとのボスに勝つと、2本もらえる'], ['★', 'コツ', '足が地面につくと速く、押し負けにくい。\n骨は殴られると折れる（背骨は折れない）']];
+  rows.forEach(([n, h, body], i) => {
+    const y = 96 + i * 104; panel(20, y, 320, 92);
+    ctx.fillStyle = PAL.ink; ctx.beginPath(); ctx.arc(50, y + 30, 17, 0, Math.PI * 2); ctx.fill(); text(ctx, n, 50, y + 31, 18, '#fff');
+    text(ctx, h, 78, y + 24, 17, PAL.ink, { align: 'left' }); body.split('\n').forEach((ln, k) => text(ctx, ln, 78, y + 50 + k * 18, 12, '#4a4370', { align: 'left' }));
+  });
+  button('back', 90, 536, 180, 50, 'もどる', 'primary', () => { G.screen = 'title'; }, { size: 20 });
+}
+
+/* ---------- 組み立て ---------- */
+const BX = 118, BY = GY - HOV;                     // 組み立て画面でのドクロの位置（画面をずらす前）
+const PALY = 452, SLOT = 48, PALX = (W - SLOT * 7) / 2;
+const VIEW_TOP = 64, VIEW_BOT = PALY - 14;         // 体が見える範囲（画面の上下）。これより外にはみ出た骨は、上下にスワイプして見る
+const PANEL = { x: 196, y: 8, w: 156, h: 112 };    // 右上の「つぎの相手」の枠
+const boneDrag = () => !!G.drag && G.drag.kind !== 'pan';
+function buildPose(now) { return poseOf(G.build, BX, BY, 1, now, boneDrag() ? 0 : 0.3); }
+function jointsOf(p) { const out = [{ x: p.skull.x, y: p.skull.y, par: -1 }]; p.segs.forEach(s => out.push({ x: s.x2, y: s.y2, par: s.i })); return out; }
+
+/* 画面を上下にずらす（カメラ）。G.camY だけ上にずらして描く。指の位置は y + G.camY で「体の座標」に直す */
+function buildExtent() {                            // 止まった姿勢での、体の上端・下端
+  const p = poseOf(G.build, BX, BY, 1, 0, 0); let top = BY - 20, bot = BY + 20;
+  for (const s of p.segs) { top = Math.min(top, s.y2 - 8); bot = Math.max(bot, s.y2 + 8); }
+  return { top, bot };
+}
+function camRange() { const e = buildExtent(); return { min: Math.min(0, e.top - 70 - VIEW_TOP), max: Math.max(0, e.bot + 82 - VIEW_BOT) }; }   // ずらせる範囲（体の大きさで決まる。骨の先の少し先まで）
+function camClamp(v) { const r = camRange(); return clamp(v, r.min, r.max); }
+function fitCam() {                                 // 体がいちばん見やすい位置。はみ出していなければ 0（いつもの位置）
+  const e = buildExtent(), down = e.bot > VIEW_BOT + 4, up = e.top < VIEW_TOP;
+  if (down && !up) return Math.min(e.bot + 20 - VIEW_BOT, Math.max(0, e.top - VIEW_TOP - 8));
+  if (up && !down) return Math.max(e.top - VIEW_TOP - 8, Math.min(0, e.bot - 4 - VIEW_BOT));
+  return 0;
+}
+function camShowBones(idxs) {                       // つないだ／向きを変えた骨の先が隠れていたら、見える所まで自動でずらす
+  const p = poseOf(G.build, BX, BY, 1, 0, 0); let to = G.camTo, low = -1e9, high = null;
+  idxs.forEach(i => { const sg = p.segs[i]; if (!sg) return; low = Math.max(low, sg.y2); const lim = sg.x2 > PANEL.x - 8 ? PANEL.y + PANEL.h + 8 : VIEW_TOP + 6; if (sg.y2 - to < lim && (!high || sg.y2 - lim < high.v)) high = { v: sg.y2 - lim, y: sg.y2, lim }; });
+  if (low - to > VIEW_BOT - 6) to = low - (VIEW_BOT - 70);
+  else if (high) to = high.y - (high.lim + 50);
+  to = camClamp(to);
+  if (Math.abs(to - G.camTo) > 1 && !G.camHint) { G.camHint = true; G.info = '体が長くなったら、画面を上下にスワイプして動かせる'; }
+  G.camTo = to;
+}
+function camStep() { if (G.drag && G.drag.kind === 'pan') return; const d = G.camTo - G.camY; G.camY = Math.abs(d) < 0.4 ? G.camTo : G.camY + d * 0.22; }
+function pill(msg, x, y, now, up) {                 // 「上／下にまだ骨がある」のお知らせ
+  ctx.save(); ctx.font = `800 11px ${FONT}`; const w = ctx.measureText(msg).width + 22, bob = Math.sin(now * 6) * 2 * (up ? -1 : 1);
+  ctx.globalAlpha = 0.92; ctx.fillStyle = PAL.ink; rr(ctx, x - w / 2, y - 11 + bob, w, 22, 11); ctx.fill(); ctx.strokeStyle = PAL.yellow; ctx.lineWidth = 1.5; ctx.stroke();
+  text(ctx, msg, x, y + 1 + bob, 11, PAL.yellow); ctx.restore();
+}
+function drawBuild(now) {
+  const cam = G.camY, d = G.drag, cap = boneCap(), boss = !!G.foe.boss;
+  // けしきと自分の体（上下にずらせる）
+  ctx.fillStyle = cam > 0 ? PAL.ground : PAL.bg0; ctx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.translate(0, -cam);
+  drawBg(ctx);
+  const p = buildPose(now); let lowTip = BY + 14, highTip = BY - 14; p.segs.forEach(sg => { lowTip = Math.max(lowTip, sg.y2); highTip = Math.min(highTip, sg.y2); });
+  ctx.save(); ctx.setLineDash([5, 5]); ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(0, GY); ctx.lineTo(W, GY); ctx.stroke(); ctx.restore();
+  const hidLow = lowTip - cam > VIEW_BOT + 2, hidHigh = highTip - cam < VIEW_TOP - 2;     // 下／上に、見えていない骨がある
+  G.hid = { low: hidLow, high: hidHigh };
+  if (!(hidLow && Math.abs(GY - 9 - cam - (VIEW_BOT - 14)) < 20)) text(ctx, lowTip > GY + 6 ? '← 地面より下の骨は、戦いで押し返される' : '← 地面（足がつくと速い）', 352, GY - 9, 10, 'rgba(255,255,255,0.55)', { align: 'right' });
+  drawPose(ctx, p, 1, { hi: d && d.kind === 'rot' ? d.i : G.sel });
+  if (d && d.kind === 'new') {                     // つなげる場所（関節）を光らせる
+    const js = jointsOf(p), pulse = 1 + 0.15 * Math.sin(now * 9);
+    js.forEach((j, k) => { if (!jointSeen(j, cam)) return; ctx.save(); ctx.strokeStyle = d.joint === k ? PAL.yellow : 'rgba(255,255,255,0.7)'; ctx.lineWidth = d.joint === k ? 3 : 2; ctx.beginPath(); ctx.arc(j.x, j.y, (d.joint === k ? 11 : 8) * pulse, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); });
+    if (d.joint >= 0) { const j = js[d.joint], a = d.ang * Math.PI / 180, L = TYPES[d.ty].L; ctx.save(); ctx.globalAlpha = 0.85; drawBone(ctx, j.x, j.y, j.x + Math.cos(a) * L, j.y + Math.sin(a) * L, d.ty, 1, { fill: '#ffe98a' }); ctx.restore(); }
+  }
+  ctx.restore();
+  if (d && d.kind === 'new' && d.joint < 0) { ctx.save(); ctx.globalAlpha = 0.8; const L = TYPES[d.ty].L; drawBone(ctx, d.x - L / 2, d.y - 26, d.x + L / 2, d.y - 26, d.ty, 1, {}); ctx.restore(); }   // まだつないでいない骨は、指について動く
+  // 上の帯：何戦目か／次の相手
+  ctx.fillStyle = 'rgba(23,19,43,0.7)'; ctx.fillRect(0, 0, W, 56);
+  if (G.mode === 'run') { text(ctx, `第${G.round}戦`, 16, 20, 18, boss ? '#ff9aa8' : '#fff', { align: 'left' }); text(ctx, `${G.wins}連勝中`, 16, 42, 12, PAL.yellow, { align: 'left' }); }
+  else { text(ctx, '挑戦状', 16, 20, 18, '#fff', { align: 'left' }); text(ctx, `骨は ${G.cBudget}本まで`, 16, 42, 12, PAL.yellow, { align: 'left' }); }
+  button('home', 96, 12, 50, 30, 'やめる', 'ghost', () => { G.screen = 'title'; }, { size: 11 });
+  soundButton(150, 10);
+  panel(PANEL.x, PANEL.y, PANEL.w, PANEL.h, { fill: boss ? '#ffe0e4' : '#efe9ff' });
+  if (boss) { ctx.save(); ctx.strokeStyle = PAL.foe; ctx.globalAlpha = 0.55 + 0.35 * Math.sin(now * 5); ctx.lineWidth = 3; rr(ctx, PANEL.x + 3, PANEL.y + 3, PANEL.w - 6, PANEL.h - 6, 11); ctx.stroke(); ctx.restore(); }
+  text(ctx, boss ? `ボス：${G.foe.name}` : `つぎの相手：${G.foe.name}`, 274, 21, 11, boss ? '#b3143a' : PAL.ink);
+  drawMini(ctx, G.foe.bones, 274, boss ? 62 : 66, 140, boss ? 56 : 62, -1, -1, now, { sc: G.foe.scale, boss });
+  text(ctx, boss ? `骨${nBones(G.foe.bones)}本　体力${G.foe.hp}　大型` : `骨${nBones(G.foe.bones)}本　体力${G.foe.hp}`, 274, boss ? 101 : 109, 10, boss ? '#8a2540' : '#5a4f8a');
+  if (boss) { ctx.save(); ctx.fillStyle = PAL.ink; rr(ctx, 222, 112, 104, 22, 11); ctx.fill(); ctx.fillStyle = PAL.yellow; rr(ctx, 224, 113.5, 100, 18, 9); ctx.fill(); text(ctx, `勝つと 骨${BOSS_REWARD}本！`, 274, 123, 10.5, PAL.ink); ctx.restore(); }
+  // はみ出した骨のお知らせ
+  if (!boneDrag()) {
+    if (hidLow) pill('▼ 上にスワイプすると 下が見える', 180, VIEW_BOT - 14, now, false);
+    if (hidHigh) pill('▲ 下にスワイプすると 上が見える', 100, VIEW_TOP + 14, now, true);
+  }
+  // 下：持っている骨
+  ctx.fillStyle = 'rgba(23,19,43,0.78)'; ctx.fillRect(0, PALY - 10, W, H - PALY + 10);
+  const over = d && d.kind === 'rot' && d.y > PALY - 10;
+  if (d && d.kind === 'rot') { ctx.fillStyle = over ? 'rgba(255,93,115,0.5)' : 'rgba(255,93,115,0.2)'; ctx.fillRect(0, PALY - 10, W, 78); }
+  TY_ORDER.forEach((ty, i) => {
+    const x = PALX + i * SLOT, n = G.inv[ty] || 0, on = n > 0 && nBones(G.build) < cap;
+    ctx.save(); ctx.globalAlpha = n > 0 ? 1 : 0.28; ctx.fillStyle = G.pickTy === ty ? '#fff3b8' : PAL.paper; ctx.strokeStyle = PAL.ink; ctx.lineWidth = 2; rr(ctx, x + 2, PALY, SLOT - 4, 56, 9); ctx.fill(); ctx.stroke();
+    const t = TYPES[ty], k = Math.min(1, 34 / (t.L + 8)); ctx.translate(x + SLOT / 2, PALY + 23); ctx.rotate(-0.6); ctx.scale(k, k); drawBone(ctx, -t.L / 2, 0, t.L / 2, 0, ty, 1, {}); ctx.restore();
+    if (n > 0) { ctx.fillStyle = on ? PAL.orange : '#777'; ctx.beginPath(); ctx.arc(x + SLOT - 9, PALY + 8, 9, 0, Math.PI * 2); ctx.fill(); text(ctx, n > 9 ? '∞' : String(n), x + SLOT - 9, PALY + 9, 11, '#fff'); }
+    text(ctx, t.name, x + SLOT / 2, PALY + 47, 8.5, PAL.ink, { a: n > 0 ? 1 : 0.3 });
+  });
+  if (d && d.kind === 'rot') text(ctx, over ? 'ここで はなすと はずれる' : '↓ ここへ運ぶと はずせる', 180, PALY + 24, 14, '#fff', { stroke: PAL.ink, sw: 5 });
+  const info = G.info || (G.sel === 0 ? '背骨：最初からある体の芯。動かせないし、折れない' : G.sel > 0 && G.build[G.sel] ? `${TYPES[G.build[G.sel][0]].name}：${TYPES[G.build[G.sel][0]].desc}` : `つないだ骨 ${nBones(G.build)}/${cap}　骨の先を引くと向きを変えられる`);
+  wrapText(ctx, info, 330, 12).slice(0, 2).forEach((ln, i) => text(ctx, ln, 180, PALY + 72 + i * 16, 12, '#fff'));
+  button('clear', 14, 574, 104, 50, 'ぜんぶはずす', 'secondary', clearBuild, { size: 13, enabled: nBones(G.build) > 0 });
+  button('fight', 128, 568, 218, 60, 'たたかう！', 'primary', startBattle, { size: 24 });
+}
+function clearBuild() { G.build.slice(1).forEach(b => { if (G.mode === 'run') G.inv[b[0]]++; }); G.build = newBuild(); G.sel = -1; G.info = ''; G.camTo = 0; sfx.off(); saveRun(); }   // 背骨だけ残す
+function pickBoneAt(x, y, p) {                     // 指の近くにある骨（先っぽ優先）
+  let best = -1, bd = 18;
+  for (const s of p.segs) { const ux = s.x2 - s.x1, uy = s.y2 - s.y1, t = clamp(((x - s.x1) * ux + (y - s.y1) * uy) / (ux * ux + uy * uy), 0, 1), d = Math.hypot(x - (s.x1 + ux * t), y - (s.y1 + uy * t)) - t * 5; if (d < bd) { bd = d; best = s.i; } }
+  return best;
+}
+function snapAng(deg) { return Math.round(deg / SNAP_DEG) * SNAP_DEG; }
+const jointSeen = (j, cam) => { const sy = j.y - cam; return sy < PALY - 10 && sy > 56 && !(j.x > PANEL.x && sy < PANEL.y + PANEL.h); };   // 画面に見えている関節だけ、つなぐ先にできる
+function buildDown(x, y) {
+  if (y >= PALY && y <= PALY + 56) {               // 持っている骨をつまむ
+    const i = Math.floor((x - PALX) / SLOT); if (i < 0 || i > 6) return false; const ty = TY_ORDER[i];
+    G.pickTy = ty; G.sel = -1; G.info = `${TYPES[ty].name}：${TYPES[ty].desc}`;
+    if (!(G.inv[ty] > 0)) return true;
+    if (nBones(G.build) >= boneCap()) { toast(`骨は ${boneCap()}本までです`); return true; }
+    G.drag = { kind: 'new', ty, x, y, joint: -1, ang: 0 }; sfx.pick(); return true;
+  }
+  const cam = G.camY, onTop = y <= 56 || (x >= PANEL.x && y <= PANEL.y + PANEL.h + 16);
+  if (y < PALY - 10 && !onTop) {
+    const p = buildPose(T()), i = pickBoneAt(x, y + cam, p);
+    if (i === 0) { G.sel = 0; G.pickTy = null; G.info = ''; sfx.ui(); return true; }                 // 体の芯の背骨は動かせない（説明だけ出す）
+    if (i > 0) { G.drag = { kind: 'rot', i, x, y, x0: x, y0: y, moved: false }; G.sel = i; G.pickTy = null; G.info = ''; sfx.pick(); return true; }
+    G.sel = -1; G.info = '';
+  }
+  // 骨もボタンもない所（空や地面）をつかんだら、画面を上下に動かせる
+  if (!onTop && (y < PALY - 10 || y > PALY + 56) && !UI.some(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h)) { startPan(x, y); return true; }
+  return false;
+}
+function startPan(x, y) { G.drag = { kind: 'pan', x, y, y0: y, cam0: G.camY, moved: false }; }
+function buildMove(x, y) {
+  const d = G.drag; if (!d) return; d.x = x; d.y = y;
+  if (d.kind === 'pan') { if (Math.abs(y - d.y0) > 4) d.moved = true; if (d.moved) G.camY = G.camTo = camClamp(d.cam0 + (d.y0 - y)); return; }   // 指を上に動かすと、けしきも上に動く（＝下が見える）
+  const cam = G.camY, wy = y + cam, p = buildPose(T());
+  if (d.kind === 'new') {
+    // つなぐ先は「指にいちばん近い、見えている関節」。向きは関節から指への方向。関節の真上で離した時は、自然な向き（ドクロなら前、骨の先ならまっすぐ先）
+    const js = jointsOf(p), L = TYPES[d.ty].L, was = d.joint;
+    let near = -1, nd = 1e9; js.forEach((j, k) => { if (!jointSeen(j, cam)) return; const v = Math.hypot(x - j.x, wy - j.y); if (v < nd) { nd = v; near = k; } });
+    d.joint = (y > PALY - 14 || nd > L + 34) ? -1 : near;                          // 手持ちの帯の上や、遠すぎる時は つながない
+    if (d.joint !== was && d.joint >= 0) sfx.ui();
+    if (d.joint >= 0) { const j = js[d.joint]; d.ang = nd > 9 ? snapAng(Math.atan2(wy - j.y, x - j.x) * 180 / Math.PI) : (j.par < 0 ? 0 : snapAng(p.abs[j.par] * 180 / Math.PI)); }
+  } else {
+    if (Math.hypot(x - d.x0, y - d.y0) > 6) d.moved = true;
+    if (d.moved && y < PALY - 10) { const s = p.segs[d.i], dist = Math.hypot(x - s.x1, wy - s.y1); if (dist > 9) { const absDeg = Math.atan2(wy - s.y1, x - s.x1) * 180 / Math.PI, parAbs = s.par < 0 ? 0 : p.abs[s.par] * 180 / Math.PI; G.build[d.i][2] = snapAng(((absDeg - parAbs + 540) % 360) - 180); } }
+  }
+}
+function buildUp() {
+  const d = G.drag; if (!d) return; G.drag = null;
+  if (d.kind === 'pan') return;
+  if (d.kind === 'new') {
+    if (d.joint >= 0) {
+      const p = poseOf(G.build, BX, BY, 1, 0, 0), j = jointsOf(p)[d.joint], par = j.par, parAbs = par < 0 ? 0 : p.abs[par] * 180 / Math.PI;   // 止まった姿勢で角度を決める（ゆれている途中の角度を使わない）
+      G.build.push([d.ty, par, snapAng(((d.ang - parAbs + 540) % 360) - 180)]); if (G.mode === 'run') G.inv[d.ty]--;
+      G.sel = G.build.length - 1; G.info = ''; sfx.snap(); G.fx.push({ k: 'ring', x: j.x, y: j.y, t0: T(), cam: true });
+      camShowBones([G.build.length - 1]);
+    }
+  } else if (d.y > PALY - 10) { const types = removeBone(G.build, d.i); if (G.mode === 'run') types.forEach(ty => { G.inv[ty]++; }); G.sel = -1; G.camTo = camClamp(G.camTo); sfx.off(); }
+  else if (d.moved) { sfx.snap(); camShowBones(subtreeOf(G.build, d.i)); }
+  saveRun();
+}
+
+/* ---------- 戦い ---------- */
+const introLen = () => (G.foe && G.foe.boss ? 2.3 : 1.5);   // 始まる前の見せ場の長さ（秒）。ボスは少し長い
+function battleStep() {
+  const w = G.world;
+  if (G.phase === 'intro') { G.pt += 1 / 60; SIM.stepWorld(w); w.ev.length = 0; if (G.pt > introLen()) { G.phase = 'fight'; w.active = true; sfx.go(); } return; }
+  const n = G.phase === 'end' ? 1 : G.speed;
+  for (let k = 0; k < n; k++) {
+    if (G.phase === 'end' && G.endT < 0.5 && (G.frame & 1)) break;          // 決着の直後は少しスロー
+    SIM.stepWorld(w);
+    for (const e of w.ev) {
+      if (e.k === 'hit') { sfx.hit(e.dmg); G.shake = Math.max(G.shake, clamp(e.dmg / 40, 0.12, 0.5)); G.fx.push({ k: 'dmg', x: e.x, y: e.y - 14, v: e.dmg, side: e.side, t0: T() }, { k: 'star', x: e.x, y: e.y, t0: T() }); }
+      else if (e.k === 'clack') sfx.clack(e.v);
+      else if (e.k === 'break') { sfx.brk(); G.fx.push({ k: 'star', x: e.x, y: e.y, t0: T(), big: true }); }
+      else if (e.k === 'over') { G.phase = 'end'; G.endT = 0; sfx.ko(); G.shake = 0.6; onBattleEnd(e.win); }
+    }
+    w.ev.length = 0;
+  }
+  if (G.phase === 'end') { G.endT += 1 / 60; if (G.endT > 2.6) afterBattle(); }
+}
+function hpBar(x, y, w, cr, name, team) {
+  const r = clamp(cr.hp / cr.hpMax, 0, 1), col = team > 0 ? PAL.me : PAL.foe;
+  ctx.save(); ctx.fillStyle = PAL.ink; rr(ctx, x - 2, y - 2, w + 4, 20, 8); ctx.fill(); ctx.fillStyle = '#3a335c'; rr(ctx, x, y, w, 16, 6); ctx.fill();
+  if (r > 0.01) { ctx.fillStyle = r < 0.3 ? '#ffb300' : col; const ww = Math.max(8, w * r); rr(ctx, team > 0 ? x : x + w - ww, y, ww, 16, 6); ctx.fill(); }
+  text(ctx, String(Math.ceil(cr.hp)), team > 0 ? x + 8 : x + w - 8, y + 9, 11, '#fff', { align: team > 0 ? 'left' : 'right', stroke: PAL.ink, sw: 3 });
+  text(ctx, name, team > 0 ? x : x + w, y + 30, 11, cr.boss ? PAL.yellow : '#fff', { align: team > 0 ? 'left' : 'right', stroke: PAL.ink, sw: 4 }); ctx.restore();
+}
+function drawFx(now) {
+  G.fx = G.fx.filter(f => now - f.t0 < (f.k === 'dmg' ? 0.8 : 0.4));
+  for (const f of G.fx) {
+    const a = now - f.t0;
+    if (f.k === 'dmg') text(ctx, String(f.v), f.x, f.y - a * 46, 15 + Math.min(12, f.v * 0.5), f.side > 0 ? '#ff8f9c' : PAL.yellow, { stroke: PAL.ink, sw: 5, a: clamp((0.8 - a) / 0.25, 0, 1), title: true, w: 400 });
+    else if (f.k === 'star') { const k = a / 0.4, R = (f.big ? 30 : 18) * easeOut(k); ctx.save(); ctx.globalAlpha = 1 - k; ctx.strokeStyle = '#fff'; ctx.lineWidth = f.big ? 4 : 3; ctx.lineCap = 'round'; for (let i = 0; i < 8; i++) { const an = i * Math.PI / 4 + 0.3; ctx.beginPath(); ctx.moveTo(f.x + Math.cos(an) * R * 0.5, f.y + Math.sin(an) * R * 0.5); ctx.lineTo(f.x + Math.cos(an) * R, f.y + Math.sin(an) * R); ctx.stroke(); } ctx.restore(); }
+    else if (f.k === 'ring') { const k = a / 0.4, y = f.y - (f.cam ? G.camY : 0); ctx.save(); ctx.globalAlpha = 1 - k; ctx.strokeStyle = PAL.yellow; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(f.x, y, 8 + 22 * easeOut(k), 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
+  }
+}
+function drawBattle(now) {
+  const w = G.world;
+  ctx.save(); if (G.shake > 0.01) ctx.translate((Math.random() - 0.5) * G.shake * 14, (Math.random() - 0.5) * G.shake * 14);
+  drawBg(ctx); drawWorldBodies(w, now); drawFx(now); ctx.restore();
+  ctx.fillStyle = 'rgba(23,19,43,0.5)'; ctx.fillRect(0, 0, W, 62);
+  hpBar(12, 12, 138, w.A, 'あなた', 1); hpBar(210, 12, 138, w.B, (G.foe.boss ? 'ボス・' : '') + G.foe.name, -1);
+  const left = Math.max(0, w.limit - w.t); text(ctx, String(Math.ceil(left)), 180, 22, 22, left < 6 ? PAL.foe : '#fff', { title: true, w: 400, stroke: PAL.ink, sw: 5 });
+  const rg = SIM.rage(w); if (G.phase === 'fight' && rg >= 1.25) text(ctx, `ヒートアップ！ ダメージ×${rg.toFixed(1)}`, 180, 78 + Math.sin(now * 10) * 1.5, 13, PAL.yellow, { stroke: PAL.ink, sw: 5 });
+  if (G.phase === 'intro') {
+    const k = G.pt, len = introLen(), boss = !!G.foe.boss; ctx.fillStyle = `rgba(23,19,43,${0.45 * clamp(len - k, 0, 1)})`; ctx.fillRect(0, 0, W, H);
+    if (boss) {                                    // ボスの時は 画面のふちが赤く光る
+      const a = clamp(len - k, 0, 1) * (0.4 + 0.15 * Math.sin(now * 12)), g = ctx.createRadialGradient(180, 320, 150, 180, 320, 440); g.addColorStop(0, 'rgba(255,40,70,0)'); g.addColorStop(1, `rgba(255,40,70,${a})`);
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    }
+    if (k < len - 0.4) {
+      if (boss) { ctx.save(); ctx.translate(180, 152); const s = 0.7 + 0.3 * easeBack(k / 0.3); ctx.scale(s, s); titleText('ボス戦！', 0, 0, 50, -0.04, '#ff8a9a'); ctx.restore(); text(ctx, `第${G.round}戦　VS ${G.foe.name}`, 180, 202, 18, '#fff', { stroke: PAL.ink, sw: 5 }); text(ctx, `勝つと 骨を${BOSS_REWARD}本 もらえる`, 180, 226, 13, PAL.yellow, { stroke: PAL.ink, sw: 5 }); }
+      else { titleText(G.mode === 'run' ? `第${G.round}戦` : '挑戦状', 180, 190, 40, -0.03); text(ctx, `VS ${G.foe.name}`, 180, 238, 18, '#fff', { stroke: PAL.ink, sw: 5 }); }
+    }
+    else { ctx.save(); ctx.translate(180, 210); const s = 0.6 + 0.6 * easeBack((k - (len - 0.4)) / 0.25); ctx.scale(s, s); titleText('ファイト！', 0, 0, 48, -0.04); ctx.restore(); }
+  }
+  if (G.phase === 'end') {
+    const k = G.endT, msg = G.result === 'A' ? '勝ち！' : G.result === 'B' ? '負け…' : '引き分け';
+    if (k > 0.5) { ctx.save(); ctx.translate(180, 200); const s = 0.5 + 0.5 * easeBack((k - 0.5) / 0.3); ctx.scale(s, s); titleText(msg, 0, 0, 60, -0.05); ctx.restore(); if (w.over.how === 'time') text(ctx, '時間切れ：体力の多い方の勝ち', 180, 250, 13, '#fff', { stroke: PAL.ink, sw: 5 }); }
+  } else if (G.phase === 'fight') button('spd', 262, 580, 84, 44, G.speed > 1 ? '▶▶ はやい' : '▶ ふつう', 'ghost', () => { G.speed = G.speed > 1 ? 1 : 2; }, { size: 13 });
+  ctx.fillStyle = 'rgba(23,19,43,0.0)';
+}
+
+/* ---------- ごほうび（相手の骨をもらう。ふつうは1本、ボスの後は2本） ---------- */
+function pickReward(ty) {                          // 2本えらぶ時：おした順に2本。3回目からは古い方と入れかわる（同じ骨を2回おせば2本とも同じ）
+  const rw = G.reward; if (rw.need <= 1) rw.picks = [ty]; else { rw.picks.push(ty); while (rw.picks.length > rw.need) rw.picks.shift(); }
+  sfx.pick();
+}
+function drawReward(now) {
+  drawBg(ctx); ctx.fillStyle = 'rgba(23,19,43,0.55)'; ctx.fillRect(0, 0, W, H);
+  const rw = G.reward, two = rw.need > 1, full = rw.picks.length >= rw.need;
+  const a = now - G.t0; ctx.save(); ctx.translate(180, 56); const s = 0.6 + 0.4 * easeBack(a / 0.35); ctx.scale(s, s); titleText(`${G.wins}連勝！`, 0, 0, 44, -0.04); ctx.restore();
+  if (G.wins === ROSTER.length) text(ctx, '全員たおした！ ここからは強化版が出てくる', 180, 96, 13, PAL.yellow, { stroke: PAL.ink, sw: 4 });
+  else if (G.foe.boss) text(ctx, G.newBest ? 'ボスを たおした！ 自己ベスト更新！' : 'ボスを たおした！', 180, 96, 13, PAL.yellow, { stroke: PAL.ink, sw: 4 });
+  else if (G.newBest) text(ctx, '自己ベスト更新！', 180, 96, 13, PAL.yellow, { stroke: PAL.ink, sw: 4 });
+  text(ctx, `${G.foe.name} の骨を ${rw.need}本 もらおう`, 180, two ? 118 : 122, 15, '#fff', { stroke: PAL.ink, sw: 5 });
+  if (two) text(ctx, '同じ骨を2回おすと、2本とも その骨になる', 180, 137, 10.5, '#d9d4f5', { stroke: PAL.ink, sw: 4 });
+  const ks = rw.kinds, top = two ? 150 : 142, ch = Math.min(76, Math.floor((552 - top) / ks.length) - 8), cw = 312;
+  ks.forEach((ty, i) => {
+    const x = 24, y = top + i * (ch + 8), t = TYPES[ty], cnt = rw.picks.filter(v => v === ty).length, on = cnt > 0;
+    hit('rw' + ty, x, y, cw, ch, () => pickReward(ty));
+    panel(x, y, cw, ch, { fill: on ? '#fff3b8' : PAL.paper });
+    ctx.save(); const k = Math.min(1, 44 / (t.L + 8)); ctx.translate(x + 34, y + ch / 2); ctx.rotate(-0.6); ctx.scale(k, k); drawBone(ctx, -t.L / 2, 0, t.L / 2, 0, ty, 1, {}); ctx.restore();
+    text(ctx, t.name, x + 64, y + ch / 2 - 10, 15, PAL.ink, { align: 'left' });
+    text(ctx, t.desc, x + 64, y + ch / 2 + 11, 10.5, '#4a4370', { align: 'left' });
+    text(ctx, `いま${G.inv[ty] + G.build.slice(1).filter(b => b[0] === ty).length}本`, x + cw - (on ? 40 : 10), y + ch / 2 - 10, 10, '#8a7fb5', { align: 'right' });
+    if (on) { ctx.save(); ctx.fillStyle = PAL.ink; ctx.beginPath(); ctx.arc(x + cw - 20, y + ch / 2 - 9, 13, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = PAL.orange; ctx.beginPath(); ctx.arc(x + cw - 20, y + ch / 2 - 10, 11.5, 0, Math.PI * 2); ctx.fill(); text(ctx, `+${cnt}`, x + cw - 20, y + ch / 2 - 9, 12, '#fff'); ctx.restore(); }
+  });
+  const nm = rw.picks.map(ty => TYPES[ty].name);
+  const label = !full ? (two ? `あと${rw.need - rw.picks.length}本 えらんでね` : '骨をえらんでね') : two ? (nm[0] === nm[1] ? `${nm[0]} を2本 もらう` : 'この2本を もらう') : `${nm[0]} をもらう`;
+  button('take', 60, 566, 240, 56, label, 'primary', () => takeReward(rw.picks.slice()), { size: 19, enabled: full });
+}
+
+/* ---------- 結果（負けた／挑戦の結果） ---------- */
+function shareLink() {   // 挑戦リンク。公開URL（SHARE_URL）か、GitHub Pages で開いている時だけ作れる
+  const h = location.hostname || '', ok = /^https?:/.test(location.protocol) && (h.endsWith('github.io') || h === 'localhost' || h === '127.0.0.1');
+  const base = SHARE_URL || (ok ? location.origin + location.pathname : ''); return base ? base + '#c=' + encodeBuild(G.build) : '';
+}
+function shareMsg() {
+  if (G.mode === 'challenge') return G.result === 'A' ? `${GAME_TITLE}\n挑戦状の骨（${nBones(G.challenge)}本）に 勝った！\nこんどは わたしの骨に 勝てる？\n${HASHTAG}` : `${GAME_TITLE}\n挑戦状の骨（${nBones(G.challenge)}本）に 負けた…\nだれか かたきを とって！\n${HASHTAG}`;
+  return `${GAME_TITLE}\n${G.wins}連勝！（骨${nBones(G.build)}本）\nこの骨に 勝てる？\n${HASHTAG}`;
+}
+function drawOver(now) {
+  drawBg(ctx); ctx.fillStyle = 'rgba(23,19,43,0.55)'; ctx.fillRect(0, 0, W, H);
+  const a = now - G.t0, ch = G.mode === 'challenge', head = ch ? (G.result === 'A' ? '挑戦に 勝った！' : '挑戦に 負けた…') : `${G.wins}連勝！`;
+  ctx.save(); ctx.translate(180, 64); const s = 0.6 + 0.4 * easeBack(a / 0.35); ctx.scale(s, s); titleText(head, 0, 0, ch ? 34 : 54, -0.04); ctx.restore();
+  if (!ch) text(ctx, G.newBest ? '自己ベスト更新！' : `最高 ${G.best}連勝`, 180, 110, 13, PAL.yellow, { stroke: PAL.ink, sw: 4 });
+  if (!ch) text(ctx, `${G.foe.boss ? 'ボス・' : ''}${G.foe.name} に やられた`, 180, 132, 12, '#d9d4f5', { stroke: PAL.ink, sw: 4 });
+  panel(40, 150, 280, 214, { fill: '#efe9ff' });
+  text(ctx, ch ? 'あなたの骨' : `あなたの骨（${nBones(G.build)}本）`, 180, 168, 12, '#5a4f8a');
+  drawMini(ctx, G.build, 180, 266, 250, 170, 1, 1, now);
+  button('again', 20, 380, 154, 50, ch ? 'もう一度 挑戦' : 'もう一度', 'primary', () => { ch ? startChallenge() : newRun(); }, { size: 16 });
+  button('title', 186, 380, 154, 50, ch ? '連勝モードへ' : 'タイトルへ', 'secondary', () => { if (ch) { loadRun() ? continueRun() : newRun(); } else G.screen = 'title'; }, { size: 15 });
+  panel(20, 446, 320, 178);
+  text(ctx, 'この骨で 挑戦状を おくる', 180, 466, 14, PAL.ink);
+  text(ctx, 'リンクを開いた人が、あなたの骨と戦えます', 180, 486, 10.5, '#5a4f8a');
+  button('x', 34, 502, 292, 48, 'Xで 挑戦状を おくる', 'me', doShare, { size: 17, enabled: nBones(G.build) > 0 });
+  button('copy', 34, 562, 140, 44, 'リンクをコピー', 'secondary', doCopy, { size: 13, enabled: nBones(G.build) > 0 });
+  button('img', 186, 562, 140, 44, '画像を保存', 'secondary', doSave, { size: 13, enabled: !!G.shareBlob });
+}
+
+/* 保存・シェア用の画像（1080×1350） */
+function renderShare() {
+  const cv = document.createElement('canvas'); cv.width = 1080; cv.height = 1350; const c = cv.getContext('2d');
+  c.save(); c.scale(3, 3); const g = c.createLinearGradient(0, 0, 0, 450); g.addColorStop(0, PAL.bg0); g.addColorStop(1, PAL.bg1); c.fillStyle = g; c.fillRect(0, 0, 360, 450);
+  const r = SIM.rng(5); c.fillStyle = '#fff'; for (let i = 0; i < 40; i++) { c.globalAlpha = 0.2 + r() * 0.5; c.fillRect(r() * 360, r() * 450, 1.4, 1.4); } c.globalAlpha = 1;
+  c.fillStyle = PAL.ground; c.fillRect(0, 372, 360, 78); c.fillStyle = '#4a3f7d'; c.fillRect(0, 372, 360, 4);
+  text(c, GAME_TITLE, 183, 53, 44, PAL.ink, { title: true, w: 400 }); text(c, GAME_TITLE, 180, 50, 44, PAL.bone, { title: true, w: 400, stroke: PAL.ink, sw: 7 });
+  const head = G.mode === 'challenge' ? (G.result === 'A' ? '挑戦に 勝った！' : '挑戦に 負けた…') : `${G.wins}連勝！`;
+  text(c, head, 180, 104, 30, PAL.yellow, { title: true, w: 400, stroke: PAL.ink, sw: 6 });
+  const b = boundsOf(G.build), k = Math.min(1.5, 300 / (b.x1 - b.x0), 220 / (b.y1 - b.y0)); c.save(); c.translate(180, 250); c.scale(k, k); drawPose(c, poseOf(G.build, -(b.x0 + b.x1) / 2, -(b.y0 + b.y1) / 2, 1, 0, 0), 1); c.restore();
+  text(c, 'この骨に 勝てる？', 180, 398, 20, '#fff', { stroke: PAL.ink, sw: 5 });
+  text(c, SHARE_URL ? `${CREDIT}  ${SHARE_URL.replace(/^https?:\/\//, '')}` : CREDIT, 180, 432, 11, '#d9d4f5'); c.restore();
+  return cv;
+}
+function makeShareBlob() {
+  G.shareBlob = null; const res = G.t0;
+  try {
+    const cv = renderShare(), set = b => { if (b && G.t0 === res && !G.shareBlob) G.shareBlob = b; };
+    if (cv.toBlob) cv.toBlob(set, 'image/png');
+    setTimeout(() => { if (G.t0 !== res || G.shareBlob) return; try { const u = cv.toDataURL('image/png'), bin = atob(u.split(',')[1]), arr = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i); set(new Blob([arr], { type: 'image/png' })); } catch (e) { /* 無視 */ } }, 1100);
+  } catch (e) { /* 画像が作れなくても遊びは続く */ }
+}
+let dlPromise = null;
+function getDownloads() { if (!dlPromise) { try { dlPromise = (window.claude && typeof window.claude.use === 'function') ? Promise.resolve(window.claude.use('downloads')).catch(() => null) : Promise.resolve(null); } catch (e) { dlPromise = Promise.resolve(null); } } return dlPromise; }
+async function doSave() {
+  if (!G.shareBlob) { toast('画像を準備中です。もう一度押してください'); return; }
+  const name = 'honetsugi.png';
+  try { const dl = await getDownloads(); if (dl) { await dl.save({ filename: name, data: G.shareBlob }); toast('画像を保存しました'); return; } } catch (e) { if (e && e.code === 'declined') { toast('保存をやめました'); return; } }
+  try { const url = URL.createObjectURL(G.shareBlob), a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 4000); toast('画像を保存しました'); } catch (e) { toast('この環境では保存できませんでした'); }
+}
+function doShare() {
+  const link = shareLink(), u = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(shareMsg()) + (link ? '&url=' + encodeURIComponent(link) : '');
+  try { const w = window.open(u, '_blank', 'noopener'); if (!w && !link) toast('この環境では開けませんでした'); } catch (e) { toast('この環境では開けませんでした'); }
+  if (!link) toast('公開URLが未設定のため、リンクなしで投稿画面を開きます');
+}
+async function doCopy() {
+  const link = shareLink(); if (!link) { toast('公開URLがまだ決まっていません（公開後に使えます）'); return; }
+  try { await navigator.clipboard.writeText(link); toast('挑戦状のリンクをコピーしました'); } catch (e) { toast('コピーできませんでした'); }
+}
+
+/* ============================================================
+   入力・メインループ
+   ============================================================ */
+function toLocal(e) { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * W / r.width, (e.clientY - r.top) * H / r.height]; }
+function onDown(e) {
+  if (e.preventDefault) e.preventDefault(); audioInit();
+  const [x, y] = toLocal(e);
+  if (G.screen === 'build' && buildDown(x, y)) { try { canvas.setPointerCapture(e.pointerId); } catch (er) { /* 無視 */ } return; }
+  if (G.screen === 'battle' && G.phase === 'end' && G.endT > 1.2) { afterBattle(); return; }
+  for (let i = UI.length - 1; i >= 0; i--) { const b = UI[i]; if (b.enabled && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { G.press = { id: b.id, t: T() }; sfx.ui(); b.fn(); return; } }
+}
+function onMove(e) { if (G.screen === 'build' && G.drag) { if (e.preventDefault) e.preventDefault(); const [x, y] = toLocal(e); buildMove(x, y); } }
+function onUp(e) { if (G.screen === 'build' && G.drag) { const [x, y] = toLocal(e); G.drag.x = x; G.drag.y = y; buildMove(x, y); buildUp(); } }
+
+let acc = 0, lastT = T();
+function frame() {
+  requestAnimationFrame(frame);
+  const now = T(); acc += Math.min(0.1, now - lastT); lastT = now;
+  let n = 0;
+  while (acc >= 1 / 60 && n < 4) { acc -= 1 / 60; n++; G.frame = (G.frame | 0) + 1; if (G.screen === 'battle') battleStep(); else if (G.screen === 'title') demoStep(); else if (G.screen === 'build') camStep(); if (G.shake > 0) G.shake = Math.max(0, G.shake - 1 / 60 * 2.2); }
+  if (n === 4) acc = 0;
+  render(now);
+}
+function render(now) {
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0); UI = [];
+  if (G.screen === 'title') drawTitle(now); else if (G.screen === 'how') drawHow(now); else if (G.screen === 'build') { drawBuild(now); drawFx(now); }
+  else if (G.screen === 'battle') drawBattle(now); else if (G.screen === 'reward') drawReward(now); else drawOver(now);
+  drawToast(now);
+}
+function resize() {
+  let vw = window.innerWidth, vh = window.innerHeight;
+  try { const r = document.getElementById('app').getBoundingClientRect(); if (r.width > 0 && r.height > 0) { vw = r.width; vh = r.height; } } catch (e) { /* 無視 */ }
+  const k = Math.min(vw / W, vh / H), cw = Math.max(1, Math.floor(W * k)), chh = Math.max(1, Math.floor(H * k)), dpr = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.style.width = cw + 'px'; canvas.style.height = chh + 'px'; canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(chh * dpr);
+}
+function readChallenge() { try { const m = /[#&]c=([0-9A-Za-z]+)/.exec(location.hash || ''); const b = m ? decodeBuild(m[1]) : null; G.challenge = b && nBones(b) > 0 ? b : null; } catch (e) { G.challenge = null; } }
+function init() {
+  readChallenge(); resize(); window.addEventListener('resize', resize); window.addEventListener('hashchange', () => { readChallenge(); G.screen = 'title'; });
+  canvas.addEventListener('pointerdown', onDown); canvas.addEventListener('pointermove', onMove); canvas.addEventListener('pointerup', onUp); canvas.addEventListener('pointercancel', () => { G.drag = null; });
+  canvas.addEventListener('wheel', e => { if (G.screen !== 'build') return; e.preventDefault(); G.camY = G.camTo = camClamp(G.camY + e.deltaY * 0.6); }, { passive: false });   // パソコンでは マウスのホイールでも上下に動かせる
+  canvas.addEventListener('contextmenu', e => e.preventDefault()); getDownloads();
+  try { if (document.fonts && document.fonts.load) document.fonts.load('40px "Dela Gothic One"', GAME_TITLE + 'あそびかた連勝！挑戦に勝った負け…引き分けファイト第戦状ボス0123456789').catch(() => {}); } catch (e) { /* 無視 */ }
+  requestAnimationFrame(frame);
+}
+window.__hn = { G, SIM, ROSTER, enemyFor, isBossRound, encodeBuild, decodeBuild, poseOf, buildPose, jointsOf, startBattle, newRun, gotoBuild, takeReward, pickReward, afterBattle, startChallenge, newBuild, nBones, camRange, fitCam, buildExtent, PALX, PALY, SLOT, BX, BY, VIEW_TOP, VIEW_BOT, TY_ORDER };
+init();
+</script>
+</body>
+</html>
