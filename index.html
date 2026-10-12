@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="google-adsense-account" content="ca-pub-2073267239630350">
 <title>ホネツギ</title>
 <meta name="description" content="骨をつないで、自動で殴りあう。勝つと相手の骨をもらえる。3戦ごとにボスが出る。あなたは何連勝できる？">
 <meta name="theme-color" content="#17132b">
@@ -10,15 +11,45 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Dela+Gothic+One&display=swap" rel="stylesheet">
 <style>
-:root { --page-bg: #17132b; --page-fg: #fbf7ec; }
+:root { --page-bg: #17132b; --page-fg: #fbf7ec;
+  --ad-h: 50px;      /* 広告バナーの高さ（スマホ） */
+  --ad-gap: 75px;    /* バナーとゲームの間の余白。いつも75px（下のスクリプト adLayout も75pxで固定） */
+}
+@media (orientation: landscape) and (min-width: 728px) and (min-height: 500px) { :root { --ad-h: 90px; } }   /* 横長の画面（パソコン・横向きのタブレット）ではバナーを90pxに */
 html, body { margin: 0; height: 100%; background: var(--page-bg); color: var(--page-fg); overflow: hidden; overscroll-behavior: none; }
 body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; }
-#app { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+/* ゲームの場所：画面の上から、バナー・ホームバー・余白のぶんを引いた所まで */
+#app { position: fixed; left: 0; right: 0; top: env(safe-area-inset-top, 0px); bottom: calc(var(--ad-h) + env(safe-area-inset-bottom, 0px) + var(--ad-gap)); display: flex; align-items: center; justify-content: center; }
 canvas { display: block; touch-action: none; outline: none; }
+/* 広告バナーの場所：画面のいちばん下。iPhoneのホームバーと重ならないよう、そのぶん下を空ける。広告が出ていなくても、この高さは変わらない */
+#ad-zone { position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; height: var(--ad-h); padding-bottom: env(safe-area-inset-bottom, 0px); background: #100d20; box-shadow: 0 -1px 0 rgba(255, 255, 255, .08); touch-action:manipulation;-webkit-user-select:auto;user-select:auto }
+#ad-banner { width: 100%; height: var(--ad-h); overflow: hidden; display: flex; align-items: center; justify-content: center; max-height:var(--ad-h);contain:layout paint }
+#ad-banner ins{max-height:var(--ad-h)!important;overflow:hidden}
+#ad-banner ins.adsbygoogle[data-ad-status="unfilled"]{display:none!important}   /* 広告が来ない時は 空の四角を出さない（帯の高さは そのまま） */
+
 </style>
 </head>
 <body>
 <div id="app"><canvas id="c" aria-label="ホネツギ（ゲーム画面）" role="img"></canvas></div>
+<!-- ▼広告バナーの場所（画面のいちばん下の帯）
+     ・帯の高さ：スマホは50px、横長の画面（パソコンなど）は90px。ゲームとの間は いつも75pxあけてあります
+     ・広告が出ない時も、この帯の高さは そのまま残ります（ゲームの位置は ずれません）
+     ・ゲームの操作は、この帯の上では反応しません -->
+<div id="ad-zone">
+  <div id="ad-banner">
+    <!-- ↓↓↓ AdSense の広告ユニットのコード（全ゲーム共通「ゲーム用バナー」・固定サイズ 320×50）↓↓↓ -->
+    <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-2073267239630350"
+         crossorigin="anonymous"></script>
+    <ins class="adsbygoogle"
+         style="display:inline-block;width:320px;height:50px"
+         data-ad-client="ca-pub-2073267239630350"
+         data-ad-slot="6261635446"></ins>
+    <script>
+         (adsbygoogle = window.adsbygoogle || []).push({});
+    </script>
+    <!-- ↑↑↑ ここまで ↑↑↑ -->
+  </div>
+</div>
 <script>
 'use strict';
 /* ============================================================
@@ -609,8 +640,8 @@ function drawCreature(c, cr, team, now) {          // 戦闘中の体（物理�
 
 /* ---------- ボタン ---------- */
 function hit(id, x, y, w, h, fn, enabled) { UI.push({ id, x, y, w, h, fn, enabled: enabled !== false }); }
-function button(id, x, y, w, h, label, kind, fn, o) {
-  o = o || {}; const enabled = o.enabled !== false; hit(id, x, y, w, h, fn, enabled);
+function button(id, x, y, w, h, label, kind, fn, o) {   // o.pad＝[上, 右, 下, 左]：絵はそのままで、押せる範囲だけを外へ広げる長さ（小さいボタンを押しやすくする）
+  o = o || {}; const enabled = o.enabled !== false, pd = o.pad || [0, 0, 0, 0]; hit(id, x - pd[3], y - pd[0], w + pd[1] + pd[3], h + pd[0] + pd[2], fn, enabled);
   const pressed = G.press && G.press.id === id && T() - G.press.t < 0.12, dy = pressed ? 2 : 0;
   const S = { primary: [PAL.orange, '#fff'], secondary: [PAL.paper, PAL.ink], ghost: ['rgba(255,255,255,0.10)', '#fff'], me: [PAL.me, PAL.ink] }[kind] || [PAL.paper, PAL.ink];
   ctx.save(); if (!enabled) ctx.globalAlpha = 0.4;
@@ -620,8 +651,8 @@ function button(id, x, y, w, h, label, kind, fn, o) {
   text(ctx, label, x + w / 2, y + dy + h / 2 + 1, o.size || Math.round(h * 0.4), S[1]);
   ctx.restore();
 }
-function soundButton(x, y) {
-  hit('snd', x, y, 34, 34, () => { muted = !muted; store.set(SAVE_MUTE, muted); if (!muted) sfx.ui(); });
+function soundButton(x, y) {   // 絵は34×34のまま。押せる範囲は42×52（上に10・下に8・左に2・右に6）
+  hit('snd', x - 2, y - 10, 42, 52, () => { muted = !muted; store.set(SAVE_MUTE, muted); if (!muted) sfx.ui(); });
   ctx.save(); ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.beginPath(); ctx.arc(x + 17, y + 17, 15, 0, Math.PI * 2); ctx.fill();
   ctx.strokeStyle = ctx.fillStyle = '#fff'; ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; const cx = x + 14, cy = y + 17;
   ctx.beginPath(); ctx.moveTo(cx - 6, cy - 3); ctx.lineTo(cx - 2, cy - 3); ctx.lineTo(cx + 3, cy - 7); ctx.lineTo(cx + 3, cy + 7); ctx.lineTo(cx - 2, cy + 3); ctx.lineTo(cx - 6, cy + 3); ctx.closePath(); ctx.fill();
@@ -664,8 +695,8 @@ function drawTitle(now) {
     button('run', 172, 556, 150, 40, '連勝モード', 'secondary', () => { loadRun() ? continueRun() : newRun(); }, { size: 14 });
   } else {
     const run = loadRun();
-    if (run) { button('cont', 60, 476, 240, 56, `つづきから（${run.wins}連勝中）`, 'primary', continueRun, { size: 18 }); button('new', 60, 544, 116, 40, 'はじめから', 'secondary', newRun, { size: 14 }); button('how', 184, 544, 116, 40, 'あそびかた', 'secondary', () => { G.screen = 'how'; }, { size: 14 }); }
-    else { button('new', 60, 480, 240, 60, 'はじめる', 'primary', newRun, { size: 24 }); button('how', 100, 552, 160, 40, 'あそびかた', 'secondary', () => { G.screen = 'how'; }, { size: 14 }); }
+    if (run) { button('cont', 60, 476, 240, 56, `つづきから（${run.wins}連勝中）`, 'primary', continueRun, { size: 18 }); button('new', 60, 544, 116, 40, 'はじめから', 'secondary', newRun, { size: 14 }); button('how', 184, 544, 116, 40, 'あそびかた', 'secondary', () => { G.screen = 'how'; }, { size: 14, pad: [5, 0, 8, 0] }); }
+    else { button('new', 60, 480, 240, 60, 'はじめる', 'primary', newRun, { size: 24 }); button('how', 100, 552, 160, 40, 'あそびかた', 'secondary', () => { G.screen = 'how'; }, { size: 14, pad: [5, 0, 8, 0] }); }
     if (G.best > 0) text(ctx, `最高 ${G.best}連勝`, 180, 610, 13, PAL.yellow, { stroke: PAL.ink, sw: 4 });
   }
   text(ctx, CREDIT, 180, 630, 10, PAL.dim);
@@ -743,7 +774,7 @@ function drawBuild(now) {
   ctx.fillStyle = 'rgba(23,19,43,0.7)'; ctx.fillRect(0, 0, W, 56);
   if (G.mode === 'run') { text(ctx, `第${G.round}戦`, 16, 20, 18, boss ? '#ff9aa8' : '#fff', { align: 'left' }); text(ctx, `${G.wins}連勝中`, 16, 42, 12, PAL.yellow, { align: 'left' }); }
   else { text(ctx, '挑戦状', 16, 20, 18, '#fff', { align: 'left' }); text(ctx, `骨は ${G.cBudget}本まで`, 16, 42, 12, PAL.yellow, { align: 'left' }); }
-  button('home', 96, 12, 50, 30, 'やめる', 'ghost', () => { G.screen = 'title'; }, { size: 11 });
+  button('home', 96, 12, 50, 30, 'やめる', 'ghost', () => { G.screen = 'title'; }, { size: 11, pad: [12, 2, 10, 4] });   // 押せる範囲は 横92〜148・縦0〜52（となりの音ボタンの範囲と、すき間なくつながる）
   soundButton(150, 10);
   panel(PANEL.x, PANEL.y, PANEL.w, PANEL.h, { fill: boss ? '#ffe0e4' : '#efe9ff' });
   if (boss) { ctx.save(); ctx.strokeStyle = PAL.foe; ctx.globalAlpha = 0.55 + 0.35 * Math.sin(now * 5); ctx.lineWidth = 3; rr(ctx, PANEL.x + 3, PANEL.y + 3, PANEL.w - 6, PANEL.h - 6, 11); ctx.stroke(); ctx.restore(); }
@@ -995,7 +1026,9 @@ async function doCopy() {
 /* ============================================================
    入力・メインループ
    ============================================================ */
-function toLocal(e) { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) * W / r.width, (e.clientY - r.top) * H / r.height]; }
+/* 指・マウスの場所を、ゲームの中の座標（横360×縦640）に直す。
+   骨をつまんだまま バナーや余白の上まで指が出た時は、ゲームの場所の下のはしで止まっているものとして扱う（バナーの上の動きは、ゲームの操作として拾わない） */
+function toLocal(e) { const r = canvas.getBoundingClientRect(), cy = Math.min(e.clientY, document.getElementById('app').getBoundingClientRect().bottom); return [(e.clientX - r.left) * W / r.width, (cy - r.top) * H / r.height]; }
 function onDown(e) {
   if (e.preventDefault) e.preventDefault(); audioInit();
   const [x, y] = toLocal(e);
@@ -1008,7 +1041,7 @@ function onUp(e) { if (G.screen === 'build' && G.drag) { const [x, y] = toLocal(
 
 let acc = 0, lastT = T();
 function frame() {
-  requestAnimationFrame(frame);
+  requestAnimationFrame(frame); layoutWatch();
   const now = T(); acc += Math.min(0.1, now - lastT); lastT = now;
   let n = 0;
   while (acc >= 1 / 60 && n < 4) { acc -= 1 / 60; n++; G.frame = (G.frame | 0) + 1; if (G.screen === 'battle') battleStep(); else if (G.screen === 'title') demoStep(); else if (G.screen === 'build') camStep(); if (G.shake > 0) G.shake = Math.max(0, G.shake - 1 / 60 * 2.2); }
@@ -1021,15 +1054,35 @@ function render(now) {
   else if (G.screen === 'battle') drawBattle(now); else if (G.screen === 'reward') drawReward(now); else drawOver(now);
   drawToast(now);
 }
+/* 広告バナーまわりの場所とり。
+   バナーの高さ（50px／横長の画面は90px）と、iPhoneのホームバーのぶんはCSSで決まる。ここでは、バナーとゲームの間の余白を決める。
+   余白は いつも75px（AD_GAP_MIN＝AD_GAP_MAX＝75）。残りの高さで ゲームを いちばん大きく出す。
+   もどり値＝ゲームに使える高さ（px） */
+const AD_GAP_MIN = 75, AD_GAP_MAX = 75;
+const appTop = () => { const a = document.getElementById('app'); return a ? Math.max(0, a.getBoundingClientRect().top) : 0; };      // ゲームの場所の上のはし（iPhoneのノッチのぶんだけ下がる。ふつうは0）
+function adLayout() {
+  const zone = document.getElementById('ad-zone'), zoneH = zone ? zone.offsetHeight : 0;      // バナー＋ホームバーぶん
+  const free = window.innerHeight - appTop() - zoneH, need = H * Math.min(1, window.innerWidth / W);    // free＝ノッチより下・バナーより上の高さ　need＝ゲームを設計どおりの大きさで出すのに要る高さ
+  const gap = zone ? clamp(free - need, AD_GAP_MIN, AD_GAP_MAX) : 0;
+  document.documentElement.style.setProperty('--ad-gap', gap + 'px');
+  return Math.max(1, free - gap);
+}
 function resize() {
-  let vw = window.innerWidth, vh = window.innerHeight;
+  let vw = window.innerWidth, vh = adLayout();
   try { const r = document.getElementById('app').getBoundingClientRect(); if (r.width > 0 && r.height > 0) { vw = r.width; vh = r.height; } } catch (e) { /* 無視 */ }
   const k = Math.min(vw / W, vh / H), cw = Math.max(1, Math.floor(W * k)), chh = Math.max(1, Math.floor(H * k)), dpr = Math.min(window.devicePixelRatio || 1, 3);
   canvas.style.width = cw + 'px'; canvas.style.height = chh + 'px'; canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(chh * dpr);
+  LSIG = layoutSig();
 }
+/* 画面の大きさや、iPhoneのホームバー・ノッチのぶん（安全領域）は、画面を回した時などに、合図（resize）よりあとで変わることがある。
+   そこで毎コマ、前に計算した時と同じかを見くらべて、変わっていたら すぐ計算し直す（指でつまんで拡大している間は、何もしない） */
+let LSIG = '';
+function layoutSig() { const z = document.getElementById('ad-zone'); return window.innerWidth + '|' + window.innerHeight + '|' + (z ? z.offsetHeight : 0) + '|' + appTop(); }
+function layoutWatch() { const vv = window.visualViewport; if (vv && Math.abs(vv.scale - 1) > 0.01) return; if (layoutSig() !== LSIG) resize(); }
 function readChallenge() { try { const m = /[#&]c=([0-9A-Za-z]+)/.exec(location.hash || ''); const b = m ? decodeBuild(m[1]) : null; G.challenge = b && nBones(b) > 0 ? b : null; } catch (e) { G.challenge = null; } }
 function init() {
-  readChallenge(); resize(); window.addEventListener('resize', resize); window.addEventListener('hashchange', () => { readChallenge(); G.screen = 'title'; });
+  readChallenge(); resize(); window.addEventListener('resize', resize);
+  window.addEventListener('hashchange', () => { readChallenge(); G.screen = 'title'; });
   canvas.addEventListener('pointerdown', onDown); canvas.addEventListener('pointermove', onMove); canvas.addEventListener('pointerup', onUp); canvas.addEventListener('pointercancel', () => { G.drag = null; });
   canvas.addEventListener('wheel', e => { if (G.screen !== 'build') return; e.preventDefault(); G.camY = G.camTo = camClamp(G.camY + e.deltaY * 0.6); }, { passive: false });   // パソコンでは マウスのホイールでも上下に動かせる
   canvas.addEventListener('contextmenu', e => e.preventDefault()); getDownloads();
